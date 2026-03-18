@@ -353,6 +353,10 @@ if selected != st.session_state.selected_index:
 ikey     = INDICES[selected]["key"]
 lot_size = INDICES[selected]["lot"]
 
+# st.empty() placeholders — fragment overwrites these in place, never appends
+_spot_placeholder = hdr_px.empty()
+_mode_placeholder = hdr_mode.empty()
+
 # ── LIVE FRAGMENT — reruns every 5 s without touching the static shell above
 @st.fragment(run_every=5)
 def _live():
@@ -367,11 +371,12 @@ def _live():
         except Exception:
             spot_display = 0.0
 
-    hdr_px.metric("Spot", f"₹{spot_display:,.2f}")
+    # Write into placeholders — replaces content instead of appending
+    _spot_placeholder.metric("Spot", f"₹{spot_display:,.2f}")
     if MOCK_MODE:
-        hdr_mode.warning("Mock")
+        _mode_placeholder.warning("Mock")
     else:
-        hdr_mode.success("Live")
+        _mode_placeholder.success("Live")
 
     if MOCK_MODE:
         st.info(
