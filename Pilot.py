@@ -44,6 +44,20 @@ TOP_N_STRIKES   = 10
 HISTORY_LEN     = 15
 MONITOR_SECS    = 300
 GEAR_PTS        = {4: 200, 3: 150, 2: 100, 1: 50}
+
+# ── Option selection scoring weights (must sum to 100) ──
+W_ADX       = 30   # option's own trend strength
+W_DELTA     = 15   # proximity to ideal delta (0.4–0.6)
+W_OI        = 15   # OI strength vs chain average
+W_VOLUME    = 10   # volume (fresh activity)
+W_SPREAD    = 10   # bid-ask tightness (lower = better)
+W_MATRIX    = 20   # OI momentum decision matrix alignment
+
+# ── Filters (hard cutoffs before scoring) ──
+DELTA_MIN   = 0.20   # drop options with |delta| below this (too far OTM)
+DELTA_MAX   = 0.80   # drop options with |delta| above this (too deep ITM)
+MAX_SPREAD_PCT = 5.0 # drop options where (ask-bid)/ltp > this %
+IV_LOOKBACK = 30     # bars of chain IV history for IV-rank calc
 ORDER_URL       = "https://api-hft.upstox.com/v2/order/place"
 BASE_URL        = "https://api.upstox.com/v2"
 
@@ -195,41 +209,230 @@ def get_chain(ikey, expiry):
     r.raise_for_status()
     return r.json()["data"]
 
+def _matrix_score(side: str, price_rising: bool, oi_rising: bool) -> float:
+    """
+    OI Momentum Decision Matrix → 0-1 score for a given option side.
+
+    Quadrant        Price   OI      CE score   PE score
+    Long Buildup    Rising  Rising  1.0        0.0
+    Short Buildup   Falling Rising  0.0        1.0
+    Short Covering  Rising  Falling 0.5        0.0   (weak rally, avoid new PE)
+    Long Unwinding  Falling Falling 0.0        0.5   (weak fall, avoid new CE)
+    """
+    if price_rising and oi_rising:          # Long Buildup
+        return 1.0 if side == "CE" else 0.0
+    if not price_rising and oi_rising:      # Short Buildup
+        return 0.0 if side == "CE" else 1.0
+    if price_rising and not oi_rising:      # Short Covering — weak bullish
+        return 0.5 if side == "CE" else 0.0
+    # Long Unwinding — weak bearish
+    return 0.0 if side == "CE" else 0.5
+
+
+def _score_option(row: dict, chain_iv_min: float, chain_iv_max: float,
+                   chain_oi_max: float, chain_vol_max: float,
+                   price_rising: bool, oi_rising: bool) -> float:
+    """
+    Composite 0-100 score:
+      ADX(30) + Delta(15) + OI(15) + Volume(10) + Spread(10) + Matrix(20)
+    All weights sum to 100.
+    """
+    # ── ADX score (0-1): higher is better, capped at 60 ──
+    adx_score = min(row.get("adx", 0) / 60.0, 1.0)
+
+    # ── Delta score (0-1): triangular peak at |delta|=0.5 ──
+    delta_abs = abs(row.get("delta", 0.5))
+    if delta_abs <= 0.5:
+        delta_score = (delta_abs - DELTA_MIN) / (0.5 - DELTA_MIN)
+    else:
+        delta_score = (DELTA_MAX - delta_abs) / (DELTA_MAX - 0.5)
+    delta_score = max(0.0, min(delta_score, 1.0))
+
+    # ── OI score (0-1): relative to chain max ──
+    oi_score = row.get("oi", 0) / max(chain_oi_max, 1)
+
+    # ── Volume score (0-1): relative to chain max ──
+    vol_score = row.get("volume", 0) / max(chain_vol_max, 1)
+
+    # ── Spread score (0-1): tighter = higher ──
+    bid = row.get("bid_price", 0)
+    ask = row.get("ask_price", 0)
+    ltp = row.get("ltp", 1)
+    if ask > bid > 0 and ltp > 0:
+        spread_score = max(0.0, 1.0 - (ask - bid) / ltp * 100 / MAX_SPREAD_PCT)
+    else:
+        spread_score = 0.5
+
+    # ── OI Momentum Matrix score (0-1) ──
+    mat_score = _matrix_score(row.get("side", "CE"), price_rising, oi_rising)
+
+    composite = (
+        W_ADX    * adx_score    +
+        W_DELTA  * delta_score  +
+        W_OI     * oi_score     +
+        W_VOLUME * vol_score    +
+        W_SPREAD * spread_score +
+        W_MATRIX * mat_score
+    ) / 100.0
+
+    return round(composite * 100, 2)
+
+
 @st.cache_data(ttl=60, show_spinner=False)
-def find_best_option(spot_bucket, ikey):
+def find_best_option(spot_bucket, ikey, h_opt_ltp_avg: float = 0.0):
     """
     Cached for 60 s — returns instantly on cache hit, only re-runs when TTL expires.
-    spot_bucket = round(spot, -2)  so small LTP moves don't bust the cache every tick.
+    spot_bucket    = round(spot, -2) so small LTP moves don't bust the cache every tick.
+    h_opt_ltp_avg  = 15-min rolling average option LTP — used for price_rising signal.
+
+    Selection pipeline:
+      1. Fetch full option chain for nearest expiry
+      2. Hard filter: ltp>0, oi>0, |delta| in [DELTA_MIN, DELTA_MAX],
+                      bid-ask spread <= MAX_SPREAD_PCT
+      3. OI percentile filter: keep top OI_PERCENTILE% by OI
+      4. Distance filter: TOP_N_STRIKES closest to spot
+      5. Fetch 1-min candles → compute ADX/+DI/-DI for each survivor
+      6. Composite score: ADX(30) + Delta(15) + OI(15) + Volume(10)
+                          + Spread(10) + Matrix(20)
+      7. Matrix: per-candidate OI momentum quadrant drives CE vs PE preference
+      8. Return highest scorer with all metadata + matrix verdict for display
     """
     expiry = get_nearest_expiry(ikey)
     chain  = get_chain(ikey, expiry)
     rows   = []
+
     for strike in chain:
         sp = strike["strike_price"]
-        for side, key in [("CE","call_options"), ("PE","put_options")]:
-            opt     = strike.get(key, {})
-            md      = opt.get("market_data", {})
-            oi      = md.get("oi", 0) or 0
-            ltp     = md.get("ltp", 0) or 0
-            prev_oi = md.get("prev_oi", 0) or 0
-            iv      = opt.get("option_greeks", {}).get("iv", 0) or 0
-            o_ikey  = opt.get("instrument_key", "")
-            if ltp > 0 and oi > 0 and o_ikey:
-                rows.append({"strike":sp,"side":side,"ltp":ltp,"oi":oi,
-                             "prev_oi":prev_oi,"iv":iv,"ikey":o_ikey,
-                             "dist":abs(sp-spot_bucket),"expiry":expiry})
-    if not rows: return None
-    df      = pd.DataFrame(rows)
-    oi_thr  = np.percentile(df["oi"], OI_PERCENTILE)
-    df_top  = df[df["oi"] >= oi_thr].nsmallest(TOP_N_STRIKES, "dist")
+        for side, opt_key in [("CE","call_options"), ("PE","put_options")]:
+            opt      = strike.get(opt_key, {})
+            md       = opt.get("market_data", {})
+            greeks   = opt.get("option_greeks", {})
+            oi       = md.get("oi", 0)       or 0
+            ltp      = md.get("ltp", 0)      or 0
+            prev_oi  = md.get("prev_oi", 0)  or 0
+            volume   = md.get("volume", 0)   or 0
+            bid      = md.get("bid_price", 0) or 0
+            ask      = md.get("ask_price", 0) or 0
+            iv       = greeks.get("iv", 0)    or 0
+            delta    = greeks.get("delta", 0) or 0
+            o_ikey   = opt.get("instrument_key", "")
+
+            if ltp <= 0 or oi <= 0 or not o_ikey:
+                continue
+
+            # ── Hard filter 1: delta range ──
+            if not (DELTA_MIN <= abs(delta) <= DELTA_MAX):
+                continue
+
+            # ── Hard filter 2: bid-ask spread ──
+            if ask > bid > 0 and ltp > 0:
+                if (ask - bid) / ltp * 100 > MAX_SPREAD_PCT:
+                    continue
+
+            rows.append({
+                "strike":    sp,
+                "side":      side,
+                "ltp":       ltp,
+                "oi":        oi,
+                "prev_oi":   prev_oi,
+                "volume":    volume,
+                "bid_price": bid,
+                "ask_price": ask,
+                "iv":        iv,
+                "delta":     delta,
+                "ikey":      o_ikey,
+                "dist":      abs(sp - spot_bucket),
+                "expiry":    expiry,
+            })
+
+    if not rows:
+        return None
+
+    df = pd.DataFrame(rows)
+
+    # ── Chain-level stats for normalisation ──
+    chain_iv_min  = df["iv"].min()
+    chain_iv_max  = df["iv"].max()
+    chain_oi_max  = df["oi"].max()
+    chain_vol_max = df["volume"].max() if df["volume"].max() > 0 else 1
+
+    # ── OI percentile filter ──
+    oi_thr = np.percentile(df["oi"], OI_PERCENTILE)
+    df     = df[df["oi"] >= oi_thr]
+
+    # ── Distance filter: TOP_N_STRIKES closest to spot ──
+    df_top = df.nsmallest(TOP_N_STRIKES, "dist")
+
+    # ── Fetch ADX for each candidate, build scored results ──
     results = []
     for _, row in df_top.iterrows():
         try:
             dmi = compute_dmi(get_candles(row["ikey"]), ADX_PERIOD)
-            if dmi: results.append({**row.to_dict(), **dmi})
+            if not dmi:
+                continue
+            candidate = {**row.to_dict(), **dmi}
+
+            # Per-candidate OI momentum matrix
+            _oi_rising    = (candidate["oi"] - candidate.get("prev_oi", candidate["oi"])) > 0
+            _price_rising = (candidate["ltp"] > h_opt_ltp_avg) if h_opt_ltp_avg > 0 else True
+
+            candidate["composite_score"] = _score_option(
+                candidate, chain_iv_min, chain_iv_max, chain_oi_max, chain_vol_max,
+                _price_rising, _oi_rising
+            )
+            # Store matrix verdict on candidate for display
+            candidate["matrix_price_rising"] = _price_rising
+            candidate["matrix_oi_rising"]    = _oi_rising
+            results.append(candidate)
         except Exception:
             pass
-    return max(results, key=lambda x: x["adx"]) if results else None
+
+    if not results:
+        return None
+
+    # ── Pick highest composite score ──
+    best = max(results, key=lambda x: x["composite_score"])
+
+    # ── Attach IV rank for display (0-100, lower = cheaper) ──
+    iv_range        = max(chain_iv_max - chain_iv_min, 1e-6)
+    best["iv_rank"] = round((best["iv"] - chain_iv_min) / iv_range * 100, 1)
+
+    # ── Resolve final matrix quadrant for display ──
+    _pr = best.get("matrix_price_rising", True)
+    _oir = best.get("matrix_oi_rising", True)
+    if _pr and _oir:
+        best["matrix_signal"] = "Long Buildup"
+        best["matrix_rec"]    = "Buy CE"
+    elif not _pr and _oir:
+        best["matrix_signal"] = "Short Buildup"
+        best["matrix_rec"]    = "Buy PE"
+    elif _pr and not _oir:
+        best["matrix_signal"] = "Short Covering"
+        best["matrix_rec"]    = "Caution — Exit PE"
+    else:
+        best["matrix_signal"] = "Long Unwinding"
+        best["matrix_rec"]    = "Caution — Exit CE"
+
+    best["matrix_aligned"] = (
+        (best["matrix_rec"] == "Buy CE" and best["side"] == "CE") or
+        (best["matrix_rec"] == "Buy PE" and best["side"] == "PE")
+    )
+
+    # ── Score breakdown including matrix ──
+    _delta_abs = abs(best.get("delta", 0.5))
+    _d_score = max(0, min(
+        (_delta_abs - DELTA_MIN) / (0.5 - DELTA_MIN) if _delta_abs <= 0.5
+        else (DELTA_MAX - _delta_abs) / (DELTA_MAX - 0.5), 1))
+    best["score_breakdown"] = {
+        "ADX":    round(W_ADX    * min(best.get("adx", 0) / 60, 1), 1),
+        "Delta":  round(W_DELTA  * _d_score, 1),
+        "OI":     round(W_OI     * best.get("oi", 0) / max(chain_oi_max, 1), 1),
+        "Volume": round(W_VOLUME * best.get("volume", 0) / max(chain_vol_max, 1), 1),
+        "Spread": round(W_SPREAD * max(0, 1 - (best.get("ask_price", 0) - best.get("bid_price", 0))
+                        / max(best.get("ltp", 1), 1) * 100 / MAX_SPREAD_PCT), 1),
+        "Matrix": round(W_MATRIX * _matrix_score(best["side"], _pr, _oir), 1),
+    }
+    return best
 
 # ─────────────────────────────────────────────
 # LIVE ORDER PLACEMENT
@@ -305,15 +508,36 @@ def mock_data(idx_name):
     bullish = pdi > ndi; side = "CE" if bullish else "PE"
     strike  = round(px/50)*50 + (50 if bullish else -50)
     oi      = int(np.random.uniform(1e5, 5e5))
+    opt_ltp = round(np.random.uniform(80, 300), 2)
+    bid     = round(opt_ltp * 0.99, 2)
+    ask     = round(opt_ltp * 1.01, 2)
+    delta   = round(np.random.uniform(0.3, 0.7) * (1 if side == "CE" else -1), 3)
+    volume  = int(np.random.uniform(5e4, 5e5))
+    iv      = round(np.random.uniform(12, 30), 2)
+    cs      = round(np.random.uniform(55, 90), 1)
     best = {
-        "strike":  strike, "side": side,
-        "ltp":     round(np.random.uniform(80, 300), 2),
-        "oi":      oi, "prev_oi": int(oi * np.random.uniform(.85, 1.15)),
-        "iv":      round(np.random.uniform(12, 30), 2),
-        "adx":     round(adx + np.random.uniform(-5, 10), 2),
-        "pdi":     pdi, "ndi": ndi,
-        "expiry":  (date.today() + timedelta(days=3)).isoformat(),
-        "ikey":    f"NSE_FO|MOCK{strike}{side}",
+        "strike":    strike, "side": side,
+        "ltp":       opt_ltp,
+        "oi":        oi, "prev_oi": int(oi * np.random.uniform(.85, 1.15)),
+        "volume":    volume,
+        "bid_price": bid, "ask_price": ask,
+        "iv":        iv,  "iv_rank": round(np.random.uniform(20, 70), 1),
+        "delta":     delta,
+        "adx":       round(adx + np.random.uniform(-5, 10), 2),
+        "pdi":       pdi, "ndi": ndi,
+        "expiry":    (date.today() + timedelta(days=3)).isoformat(),
+        "ikey":      f"NSE_FO|MOCK{strike}{side}",
+        "composite_score":      cs,
+        "matrix_price_rising": bullish,
+        "matrix_oi_rising":    oi > int(np.random.uniform(1e5, 5e5)) * 0.9,
+        "matrix_signal":       "Long Buildup" if bullish else "Short Buildup",
+        "matrix_rec":          "Buy CE" if bullish else "Buy PE",
+        "matrix_aligned":      True,
+        "score_breakdown": {
+            "ADX":    round(cs * 0.30, 1), "Delta":  round(cs * 0.15, 1),
+            "OI":     round(cs * 0.15, 1), "Volume": round(cs * 0.10, 1),
+            "Spread": round(cs * 0.10, 1), "Matrix": round(cs * 0.20, 1),
+        },
     }
     return px, {"adx":adx,"pdi":pdi,"ndi":ndi}, best
 
@@ -405,8 +629,9 @@ def _live():
                 st.warning("Waiting for candles — market may have just opened.")
                 st.stop()
             # Round spot to nearest 100 so tiny moves don't bust the 60-s cache
-            spot_bucket = round(live_px, -2)
-            best_opt    = find_best_option(spot_bucket, ikey)
+            spot_bucket    = round(live_px, -2)
+            _h_ltp_avg     = ha(st.session_state.h_opt_ltp)
+            best_opt       = find_best_option(spot_bucket, ikey, _h_ltp_avg)
     except Exception as e:
         st.error(f"API error: {e}")
         st.stop()
@@ -481,19 +706,124 @@ def _live():
     </div>
     """, unsafe_allow_html=True)
 
-    d1,d2,d3,d4,d5 = st.columns(5)
-    d1.metric("OI",        f"{best_opt['oi']:,}")
-    d2.metric("OI change", f"{oi_chg:+,}", f"{oi_chg/max(best_opt.get('prev_oi',1),1)*100:+.1f}%")
-    d3.metric("IV",        f"{best_opt['iv']:.1f}%")
-    d4.metric("+DI",       f"{best_opt['pdi']:.2f}")
-    d5.metric("-DI",       f"{best_opt['ndi']:.2f}")
+    # Row 1: core metrics
+    d1,d2,d3,d4,d5,d6 = st.columns(6)
+    d1.metric("OI",           f"{best_opt['oi']:,}")
+    d2.metric("OI change",    f"{oi_chg:+,}", f"{oi_chg/max(best_opt.get('prev_oi',1),1)*100:+.1f}%")
+    d3.metric("IV",           f"{best_opt['iv']:.1f}%")
+    d4.metric("IV rank",      f"{best_opt.get('iv_rank', 0):.0f}/100",
+              help="0=cheapest, 100=most expensive vs today's chain")
+    d5.metric("|Delta|",      f"{abs(best_opt.get('delta', 0)):.2f}",
+              help="0.4–0.6 = near ATM ideal")
+    d6.metric("Volume",       f"{best_opt.get('volume', 0):,}")
 
-    oi_note = (
-        ("Rising CE OI → resistance building" if oi_chg > 0 else "Falling CE OI → short covering, bullish")
-        if best_opt["side"] == "CE" else
-        ("Rising PE OI → support building"    if oi_chg > 0 else "Falling PE OI → short covering, bearish")
+    # Row 2: composite score breakdown
+    sb = best_opt.get("score_breakdown", {})
+    cs = best_opt.get("composite_score", 0)
+    score_color = "#27500A" if cs >= 70 else "#633806" if cs >= 50 else "#791F1F"
+    score_bg    = "#EAF3DE" if cs >= 70 else "#FAEEDA" if cs >= 50 else "#FCEBEB"
+    _sb_html = "".join(
+        f'<div style="font-size:11px;color:{score_color}">'
+        f'<span style="opacity:.65">{k}</span>&nbsp;<strong>{v}</strong></div>'
+        for k, v in sb.items()
     )
-    st.caption(f"OI insight: {oi_note}   |   `{best_opt['ikey']}`")
+    st.markdown(
+        f'<div style="border-radius:8px;background:{score_bg};padding:10px 14px;' 
+        f'margin:8px 0;display:flex;align-items:center;gap:16px;flex-wrap:wrap">' 
+        f'<div style="font-size:12px;color:{score_color}">' 
+        f'<span style="font-size:20px;font-weight:500">{cs:.0f}</span>/100 composite score' 
+        f'</div>{_sb_html}</div>',
+        unsafe_allow_html=True
+    )
+
+    # Row 3: bid-ask spread display
+    bid = best_opt.get("bid_price", 0); ask = best_opt.get("ask_price", 0)
+    if bid and ask:
+        spread_pct = (ask - bid) / max(best_opt["ltp"], 1) * 100
+        spread_col = "#3B6D11" if spread_pct < 1.5 else "#BA7517" if spread_pct < 3 else "#A32D2D"
+        st.markdown(
+            f"<span style='font-size:12px;color:{spread_col}'>"
+            f"Bid ₹{bid:.2f} &nbsp;/&nbsp; Ask ₹{ask:.2f} &nbsp;|&nbsp; "
+            f"Spread {spread_pct:.1f}%"
+            f"{'&nbsp;✓ tight' if spread_pct < 1.5 else '&nbsp;⚠ wide' if spread_pct > 3 else ''}"
+            f"</span>",
+            unsafe_allow_html=True
+        )
+
+    # ── OI MOMENTUM DECISION MATRIX ──────────────────────────────────────
+    # Values pre-computed inside find_best_option using per-candidate OI momentum
+    # and 15-min LTP average — matrix score already factored into composite score
+    _price_rising  = best_opt.get("matrix_price_rising", oi_chg > 0)
+    _oi_rising     = best_opt.get("matrix_oi_rising",    oi_chg > 0)
+    _matrix_signal = best_opt.get("matrix_signal", "Long Buildup")
+    _matrix_rec    = best_opt.get("matrix_rec",    "Buy CE")
+    _aligned       = best_opt.get("matrix_aligned", True)
+
+    _MATRIX_STYLES = {
+        "Long Buildup":   ("#27500A","#EAF3DE","#3B6D11","▲",
+                           "New buyers entering — trend confirmed"),
+        "Short Buildup":  ("#791F1F","#FCEBEB","#A32D2D","▼",
+                           "New sellers aggressive — bearish pressure"),
+        "Short Covering": ("#633806","#FAEEDA","#854F0B","△",
+                           "Sellers exiting; rally may be weak or unsustained"),
+        "Long Unwinding": ("#633806","#FAEEDA","#854F0B","▽",
+                           "Buyers exiting; trend weakening or reversing"),
+    }
+    _matrix_col, _matrix_bg, _matrix_border, _matrix_icon, _matrix_detail =         _MATRIX_STYLES.get(_matrix_signal, _MATRIX_STYLES["Long Buildup"])
+
+    _align_txt = "Matrix aligned — included in score" if _aligned                  else "Matrix conflicts — score penalised"
+    _align_col = "#27500A" if _aligned else "#A32D2D"
+
+    st.markdown(
+        f'''<div style="border:1.5px solid {_matrix_border};border-radius:10px;
+                padding:12px 16px;background:{_matrix_bg};margin:10px 0">
+  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+    <div>
+      <div style="font-size:10px;font-weight:500;letter-spacing:.06em;
+                  color:{_matrix_col};margin-bottom:2px">OI MOMENTUM MATRIX</div>
+      <div style="display:flex;align-items:center;gap:8px">
+        <span style="font-size:18px;font-weight:500;color:{_matrix_col}">{_matrix_icon} {_matrix_signal}</span>
+        <span style="background:{_matrix_border};color:#fff;border-radius:5px;
+                     padding:2px 9px;font-size:11px;font-weight:500">{_matrix_rec}</span>
+      </div>
+      <div style="font-size:12px;color:{_matrix_col};margin-top:3px;opacity:.85">{_matrix_detail}</div>
+    </div>
+    <div style="text-align:right">
+      <div style="font-size:11px;color:{_align_col};font-weight:500">{_align_txt}</div>
+      <div style="font-size:10px;color:{_matrix_col};margin-top:2px;opacity:.7">
+        Price {'rising' if _price_rising else 'falling'} vs 15m avg
+        &nbsp;|&nbsp; OI {'increasing' if _oi_rising else 'decreasing'}
+        &nbsp;|&nbsp; Chg {oi_chg:+,}
+      </div>
+    </div>
+  </div>
+  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-top:10px;
+              font-size:10px;border-top:0.5px solid {_matrix_border};padding-top:8px">
+    <div style="text-align:center;padding:4px;border-radius:4px;background:#EAF3DE">
+      <div style="color:#3B6D11;font-weight:500">Price ▲ OI ▲</div>
+      <div style="color:#27500A">Long Buildup</div>
+      <div style="color:#3B6D11;font-weight:500">Buy CE</div>
+    </div>
+    <div style="text-align:center;padding:4px;border-radius:4px;background:#FCEBEB">
+      <div style="color:#A32D2D;font-weight:500">Price ▼ OI ▲</div>
+      <div style="color:#791F1F">Short Buildup</div>
+      <div style="color:#A32D2D;font-weight:500">Buy PE</div>
+    </div>
+    <div style="text-align:center;padding:4px;border-radius:4px;background:#FAEEDA">
+      <div style="color:#854F0B;font-weight:500">Price ▲ OI ▼</div>
+      <div style="color:#633806">Short Covering</div>
+      <div style="color:#854F0B;font-weight:500">Exit PE</div>
+    </div>
+    <div style="text-align:center;padding:4px;border-radius:4px;background:#FAEEDA">
+      <div style="color:#854F0B;font-weight:500">Price ▼ OI ▼</div>
+      <div style="color:#633806">Long Unwinding</div>
+      <div style="color:#854F0B;font-weight:500">Exit CE</div>
+    </div>
+  </div>
+</div>''',
+        unsafe_allow_html=True
+    )
+    st.caption(f"OI insight: {_matrix_detail}   |   `{best_opt['ikey']}`")
 
     st.divider()
 
