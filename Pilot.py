@@ -102,6 +102,19 @@ def _init():
         lo_qty          = 1,
         lo_target_pts   = 50,
         lo_tsl_pct      = 30.0,
+        # sv_ = shared view-state written by _fetch_data, read by display fragments
+        sv_live_px      = None,
+        sv_dmi          = None,
+        sv_best_opt     = None,
+        sv_score        = 0,
+        sv_checks       = [],
+        sv_idx_g        = 1,
+        sv_opt_g        = 1,
+        sv_bullish      = True,
+        sv_oi_chg       = 0,
+        sv_now_ts       = "",
+        sv_fetch_error  = "",
+        sv_mock_banner  = False,
 
     )
     for k, v in defaults.items():
@@ -585,8 +598,9 @@ _spot_placeholder = hdr_px.empty()
 _mode_placeholder = hdr_mode.empty()
 
 # ── LIVE FRAGMENT — reruns every 5 s without touching the static shell above
+
 @st.fragment(run_every=5)
-def _live():
+def _fetch_data():
     # Live spot price
     if MOCK_MODE:
         spot_display = round({"Nifty 50":24500,"Nifty Bank":51000,"Nifty Fin Svc":22000,
@@ -605,13 +619,11 @@ def _live():
     else:
         _mode_placeholder.success("Live")
 
-    if MOCK_MODE:
-        st.info(
-            "Running in **mock mode**. "
-            "Add your Upstox access token to `.streamlit/secrets.toml` under `[upstox]` to go live."
-        )
+    # Store mock banner flag — displayed by _frag_index instead
+    st.session_state.sv_mock_banner = MOCK_MODE
 
     # ─────────────────────────────────────────────
+
     # FETCH MARKET DATA
     # ─────────────────────────────────────────────
     # Index LTP + DMI  →  every 5 s  (fast single-call APIs)
@@ -626,19 +638,20 @@ def _live():
             df_idx  = get_candles(ikey)
             dmi     = compute_dmi(df_idx, ADX_PERIOD)
             if not dmi:
-                st.warning("Waiting for candles — market may have just opened.")
-                st.stop()
+                st.session_state.sv_fetch_error = "Waiting for candles — market may have just opened."
+                return
             # Round spot to nearest 100 so tiny moves don't bust the 60-s cache
             spot_bucket    = round(live_px, -2)
             _h_ltp_avg     = ha(st.session_state.h_opt_ltp)
             best_opt       = find_best_option(spot_bucket, ikey, _h_ltp_avg)
     except Exception as e:
-        st.error(f"API error: {e}")
-        st.stop()
+        st.session_state.sv_fetch_error = f"API error: {e}"
+        return
 
     if not best_opt:
-        st.warning("No option signal — chain may be empty or market just opened.")
-        st.stop()
+        st.session_state.sv_fetch_error = "No option signal — chain may be empty or market just opened."
+        return
+    st.session_state.sv_fetch_error = ""
 
     # Patch the cached option LTP with a fresh quote every 5 s
     if not MOCK_MODE:
@@ -664,20 +677,57 @@ def _live():
     oi_chg           = best_opt["oi"] - best_opt.get("prev_oi", best_opt["oi"])
 
     # ══════════════════════════════════════════════
-    # DASHBOARD 1 — INDEX + BUY SIGNAL
-    # ══════════════════════════════════════════════
-    st.subheader(f"{selected} — index")
+    # Cache all derived vars so display fragments can read them without re-fetching
+    st.session_state.sv_live_px  = live_px
+    st.session_state.sv_dmi      = dmi
+    st.session_state.sv_best_opt = best_opt
+    st.session_state.sv_score    = score
+    st.session_state.sv_checks   = checks
+    st.session_state.sv_idx_g    = idx_g
+    st.session_state.sv_opt_g    = opt_g
+    st.session_state.sv_bullish  = bullish
+    st.session_state.sv_oi_chg   = oi_chg
+    st.session_state.sv_now_ts   = now_ts
+
+@st.fragment(run_every=5)
+def _frag_index():
+    # Show banner / errors from fetch layer
+    if st.session_state.get("sv_mock_banner"):
+        st.info("Mock mode — add Upstox token to `.streamlit/secrets.toml` to go live.")
+    err = st.session_state.get("sv_fetch_error", "")
+    if err:
+        st.warning(err)
+        return
+    if "sv_live_px" not in st.session_state or st.session_state.sv_live_px is None:
+        st.caption("Loading…")
+        return
+    live_px = st.session_state.sv_live_px
+    dmi     = st.session_state.sv_dmi
+    idx_g   = st.session_state.sv_idx_g
+    bullish = st.session_state.sv_bullish
+    sig     = "BULLISH" if bullish else "BEARISH"
+    if st.session_state.last_signal and st.session_state.last_signal != sig:
+        browser_alert("SIGNAL CHANGE", f"{selected} is now {sig}")
+    st.session_state.last_signal = sig
     c1, c2, c3, c4 = st.columns(4)
     c1.metric("LTP",       f"₹{live_px:,.2f}")
     c2.metric("ADX",       f"{dmi['adx']:.2f}", f"Gear {idx_g} → +{GEAR_PTS[idx_g]} pts")
     c3.metric("+DI / -DI", f"{dmi['pdi']:.2f} / {dmi['ndi']:.2f}")
-    c4.metric("Signal",    "BULLISH" if bullish else "BEARISH")
+    c4.metric("Signal",    sig)
 
-    sig = "BULLISH" if bullish else "BEARISH"
-    if st.session_state.last_signal and st.session_state.last_signal != sig:
-        browser_alert("SIGNAL CHANGE", f"{selected} is now {sig}")
-    st.session_state.last_signal = sig
-
+@st.fragment(run_every=5)
+def _frag_buy_trade():
+    if "sv_best_opt" not in st.session_state:
+        st.caption("Loading option data…")
+        return
+    best_opt = st.session_state.sv_best_opt
+    dmi      = st.session_state.sv_dmi
+    score    = st.session_state.sv_score
+    opt_g    = st.session_state.sv_opt_g
+    oi_chg   = st.session_state.sv_oi_chg
+    bullish  = st.session_state.sv_bullish
+    now_ts   = st.session_state.sv_now_ts
+    checks   = st.session_state.sv_checks
     st.divider()
 
     # Best option buy box
@@ -777,7 +827,7 @@ def _live():
     st.markdown(
         f'''<div style="border:1.5px solid {_matrix_border};border-radius:10px;
                 padding:12px 16px;background:{_matrix_bg};margin:10px 0">
-  <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
+      <div style="display:flex;align-items:center;justify-content:space-between;flex-wrap:wrap;gap:8px">
     <div>
       <div style="font-size:10px;font-weight:500;letter-spacing:.06em;
                   color:{_matrix_col};margin-bottom:2px">OI MOMENTUM MATRIX</div>
@@ -796,8 +846,8 @@ def _live():
         &nbsp;|&nbsp; Chg {oi_chg:+,}
       </div>
     </div>
-  </div>
-  <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-top:10px;
+      </div>
+      <div style="display:grid;grid-template-columns:repeat(4,1fr);gap:4px;margin-top:10px;
               font-size:10px;border-top:0.5px solid {_matrix_border};padding-top:8px">
     <div style="text-align:center;padding:4px;border-radius:4px;background:#EAF3DE">
       <div style="color:#3B6D11;font-weight:500">Price ▲ OI ▲</div>
@@ -819,8 +869,8 @@ def _live():
       <div style="color:#633806">Long Unwinding</div>
       <div style="color:#854F0B;font-weight:500">Exit CE</div>
     </div>
-  </div>
-</div>''',
+      </div>
+    </div>''',
         unsafe_allow_html=True
     )
     st.caption(f"OI insight: {_matrix_detail}   |   `{best_opt['ikey']}`")
@@ -870,22 +920,22 @@ def _live():
         _ltp_chg = round(_cur_ltp - _eltp, 2)
         _chg_col = "#3B6D11" if _ltp_chg >= 0 else "#A32D2D"
         st.markdown(f"""
-<div style="border:2px solid {_opt_bdr};border-radius:10px;padding:11px 16px;
+    <div style="border:2px solid {_opt_bdr};border-radius:10px;padding:11px 16px;
             background:{_opt_bg};margin-bottom:12px;
             display:flex;align-items:center;justify-content:space-between">
-  <div style="display:flex;align-items:center;gap:10px">
+      <div style="display:flex;align-items:center;gap:10px">
     <span style="background:{_opt_bdr};color:#fff;border-radius:5px;
                  padding:2px 9px;font-size:11px;font-weight:500">{_side}</span>
     <span style="font-size:20px;font-weight:500;color:{_opt_tc}">{_strike}</span>
     <span style="font-size:12px;color:{_opt_tc};opacity:.75">exp {_expiry}</span>
-  </div>
-  <div style="text-align:right">
+      </div>
+      <div style="text-align:right">
     <span style="font-size:18px;font-weight:500;color:{_opt_tc}">₹{_cur_ltp:.2f}</span>
     <span style="font-size:12px;color:{_chg_col};margin-left:6px">
       {'+' if _ltp_chg >= 0 else ''}{_ltp_chg:.2f} from entry</span>
-  </div>
-</div>
-""", unsafe_allow_html=True)
+      </div>
+    </div>
+    """, unsafe_allow_html=True)
 
         st.warning(f"Trade live — target +{st.session_state.target_pts} pts | Trailing SL {st.session_state.trailing_sl_pct:.0f}%")
         m1,m2,m3,m4 = st.columns(4)
@@ -914,6 +964,17 @@ def _live():
                          hide_index=True, use_container_width=True)
 
     # ══════════════════════════════════════════════
+
+@st.fragment(run_every=5)
+def _frag_analysis():
+    if "sv_best_opt" not in st.session_state:
+        st.caption("Loading…")
+        return
+    best_opt = st.session_state.sv_best_opt
+    dmi      = st.session_state.sv_dmi
+    score    = st.session_state.sv_score
+    checks   = st.session_state.sv_checks
+    now_ts   = st.session_state.sv_now_ts
     # DASHBOARD 2 — SIGNAL ANALYSIS + 15-MIN
     # ══════════════════════════════════════════════
     st.markdown("---")
@@ -995,6 +1056,16 @@ def _live():
                      hide_index=True, use_container_width=True)
 
     # ══════════════════════════════════════════════
+
+@st.fragment(run_every=10)
+def _frag_orders():
+    if "sv_best_opt" not in st.session_state:
+        st.caption("Loading…")
+        return
+    best_opt = st.session_state.sv_best_opt
+    live_px  = st.session_state.sv_live_px
+    opt_g    = st.session_state.sv_opt_g
+    now_ts   = st.session_state.sv_now_ts
     # DASHBOARD 3 — LIVE ORDER PLACEMENT
     # ══════════════════════════════════════════════
     st.markdown("---")
@@ -1162,12 +1233,25 @@ def _live():
                             st.error(f"Exit failed: {e}")
                         st.session_state.trade_active = False; st.rerun()
 
-    # ── FOOTER ──
-    st.caption(
-        f"Index: `{ikey}` | Lot size: {lot_size} | ADX period: {ADX_PERIOD} | "
-        f"History: {len(st.session_state.h_opt_ltp)}/{HISTORY_LEN} bars | "
-        f"Refresh: {pd.Timestamp.now(tz='Asia/Kolkata').strftime('%H:%M:%S IST')}"
-    )
-    # auto-refresh handled by @st.fragment(run_every=5)
+# ── Page layout — static chrome rendered once, fragments fill the slots ──
+_fetch_data()
 
-_live()
+st.subheader(f"{selected} — index")
+_frag_index()
+
+st.divider()
+st.subheader("Best option to buy")
+_frag_buy_trade()
+
+st.markdown("---")
+st.subheader("Signal analysis — 15-min comparison & trade monitor")
+_frag_analysis()
+
+st.markdown("---")
+st.subheader("Live order placement")
+_frag_orders()
+
+st.caption(
+    f"Index: `{ikey}` | Lot size: {lot_size} | ADX period: {ADX_PERIOD} | "
+    f"History: {len(st.session_state.h_opt_ltp)}/{HISTORY_LEN} bars"
+)
