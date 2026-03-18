@@ -878,11 +878,19 @@ def _frag_buy_trade():
     st.divider()
 
     # ── MOCKUP TRADE CONTROL ──────────────────────
+    # Rules:
+    #   SL  = entry_ltp − (target_pts × 0.50)   ← fixed, ~50% of target
+    #   Minimum hold = 15 min from entry         ← SL + exit blocked until then
+    #   Trailing SL  = activates after min-hold  ← only trails once 15 min elapsed
+    MIN_HOLD_SECS = 900   # 15 minutes
+
     st.subheader("Trade control — mockup")
-    st.caption("Simulates entries and exits locally. No real order is sent.")
+    st.caption("SL ≈ 50% of target | Minimum hold 15 min | No real order sent.")
 
     if not st.session_state.trade_active or st.session_state.trade_mode != "mockup":
         if st.button("Enter trade (mockup)", use_container_width=True, type="primary"):
+            _tgt   = GEAR_PTS[opt_g]
+            _sl_pt = round(_tgt * 0.50, 2)           # SL = 50% of target pts
             st.session_state.trade_active  = True
             st.session_state.trade_mode    = "mockup"
             st.session_state.entry_price   = best_opt["ltp"]
@@ -894,18 +902,41 @@ def _frag_buy_trade():
             st.session_state.entry_expiry  = best_opt["expiry"]
             st.session_state.entry_ikey    = best_opt["ikey"]
             st.session_state.entry_opt_ltp = best_opt["ltp"]
-            st.session_state.target_pts    = GEAR_PTS[opt_g]
-            st.session_state.exit_price    = round(best_opt["ltp"] + GEAR_PTS[opt_g], 2)
-            st.session_state.sl_price      = round(best_opt["ltp"] * 0.85, 2)
+            st.session_state.target_pts    = _tgt
+            st.session_state.exit_price    = round(best_opt["ltp"] + _tgt, 2)
+            st.session_state.sl_price      = round(best_opt["ltp"] - _sl_pt, 2)
             st.session_state.highest_pnl   = 0.0
             st.session_state.monitor_start = time.time()
-            add_log("act_log", {"time":now_ts,"event":f"[MOCK] Entered {best_opt['side']} {int(best_opt['strike'])} @ ₹{best_opt['ltp']:.2f}"})
+            add_log("act_log", {
+                "time": now_ts,
+                "event": (f"[MOCK] Entered {best_opt['side']} {int(best_opt['strike'])} "
+                          f"@ ₹{best_opt['ltp']:.2f} | Target +{_tgt} | SL -{ _sl_pt}")
+            })
             st.rerun()
+
     elif st.session_state.trade_active and st.session_state.trade_mode == "mockup":
-        pnl = round(best_opt["ltp"] - st.session_state.entry_price, 2)
-        tsl = update_trailing_sl(best_opt["ltp"], st.session_state.entry_price,
-                                 st.session_state.trailing_sl_pct)
-        st.session_state.sl_price = tsl
+        _entry     = st.session_state.entry_price
+        _sl_fixed  = st.session_state.sl_price          # fixed SL set at entry
+        _target    = st.session_state.exit_price
+        _tgt_pts   = st.session_state.target_pts
+        _sl_pts    = round(_entry - _sl_fixed, 2)        # pts at risk
+
+        pnl        = round(best_opt["ltp"] - _entry, 2)
+        elapsed    = int(time.time() - st.session_state.monitor_start) if st.session_state.monitor_start else 0
+        min_held   = elapsed >= MIN_HOLD_SECS
+        remaining  = max(0, MIN_HOLD_SECS - elapsed)
+        rm, rs     = divmod(remaining, 60)
+
+        # Trailing SL only activates after minimum hold
+        if min_held:
+            tsl = update_trailing_sl(best_opt["ltp"], _entry,
+                                     st.session_state.trailing_sl_pct)
+            # TSL can only tighten the SL, never loosen below fixed SL
+            effective_sl = max(tsl, _sl_fixed)
+        else:
+            effective_sl = _sl_fixed
+
+        st.session_state.sl_price = effective_sl
 
         # ── Selected option pill ──
         _side    = st.session_state.entry_side
@@ -920,43 +951,93 @@ def _frag_buy_trade():
         _ltp_chg = round(_cur_ltp - _eltp, 2)
         _chg_col = "#3B6D11" if _ltp_chg >= 0 else "#A32D2D"
         st.markdown(f"""
-    <div style="border:2px solid {_opt_bdr};border-radius:10px;padding:11px 16px;
-            background:{_opt_bg};margin-bottom:12px;
-            display:flex;align-items:center;justify-content:space-between">
-      <div style="display:flex;align-items:center;gap:10px">
+<div style="border:2px solid {_opt_bdr};border-radius:10px;padding:11px 16px;
+        background:{_opt_bg};margin-bottom:12px;
+        display:flex;align-items:center;justify-content:space-between">
+  <div style="display:flex;align-items:center;gap:10px">
     <span style="background:{_opt_bdr};color:#fff;border-radius:5px;
                  padding:2px 9px;font-size:11px;font-weight:500">{_side}</span>
     <span style="font-size:20px;font-weight:500;color:{_opt_tc}">{_strike}</span>
     <span style="font-size:12px;color:{_opt_tc};opacity:.75">exp {_expiry}</span>
-      </div>
-      <div style="text-align:right">
+  </div>
+  <div style="text-align:right">
     <span style="font-size:18px;font-weight:500;color:{_opt_tc}">₹{_cur_ltp:.2f}</span>
     <span style="font-size:12px;color:{_chg_col};margin-left:6px">
       {'+' if _ltp_chg >= 0 else ''}{_ltp_chg:.2f} from entry</span>
-      </div>
-    </div>
-    """, unsafe_allow_html=True)
+  </div>
+</div>
+""", unsafe_allow_html=True)
 
-        st.warning(f"Trade live — target +{st.session_state.target_pts} pts | Trailing SL {st.session_state.trailing_sl_pct:.0f}%")
-        m1,m2,m3,m4 = st.columns(4)
-        m1.metric("Entry price",  f"₹{st.session_state.entry_price:,.2f}")
-        m2.metric("Exit target",  f"₹{st.session_state.exit_price:,.2f}")
-        m3.metric("Trailing SL",  f"₹{tsl:,.2f}")
+        # ── Hold timer bar ──
+        if not min_held:
+            hold_pct = int(elapsed / MIN_HOLD_SECS * 100)
+            hold_col = "#185FA5" if hold_pct < 50 else "#BA7517" if hold_pct < 85 else "#3B6D11"
+            st.markdown(f"""
+<div style="margin-bottom:10px">
+  <div style="display:flex;justify-content:space-between;font-size:11px;
+              color:var(--color-text-secondary);margin-bottom:3px">
+    <span>Min hold — {rm}:{rs:02d} remaining</span>
+    <span>{hold_pct}%</span>
+  </div>
+  <div style="height:6px;border-radius:3px;background:var(--color-background-secondary)">
+    <div style="height:100%;width:{hold_pct}%;border-radius:3px;
+                background:{hold_col};transition:width 1s"></div>
+  </div>
+  <div style="font-size:10px;color:var(--color-text-tertiary);margin-top:2px">
+    SL &amp; exit locked until 15-min minimum hold completes
+  </div>
+</div>
+""", unsafe_allow_html=True)
+        else:
+            st.markdown(
+                '<div style="font-size:11px;color:#3B6D11;margin-bottom:8px">'
+                '✓ 15-min minimum hold complete — SL and exit active</div>',
+                unsafe_allow_html=True
+            )
+
+        # ── Trade metrics ──
+        _warn_msg = (f"Trade live — Target +{_tgt_pts} pts  |  "
+                     f"SL −{_sl_pts} pts  |  "
+                     f"{'TSL active' if min_held else f'Hold {rm}:{rs:02d}'}")
+        st.warning(_warn_msg)
+
+        m1, m2, m3, m4, m5 = st.columns(5)
+        m1.metric("Entry",        f"₹{_entry:,.2f}")
+        m2.metric("Target",       f"₹{_target:,.2f}", f"+{_tgt_pts} pts")
+        m3.metric("Stop loss",    f"₹{effective_sl:,.2f}",
+                  f"−{_sl_pts} pts{'  (fixed)' if not min_held else '  (trailing)'}")
         m4.metric("Live P&L",     f"₹{pnl:+,.2f}")
+        m5.metric("Hold time",    f"{elapsed//60}m {elapsed%60:02d}s",
+                  "✓ free to exit" if min_held else f"locked {rm}:{rs:02d}")
 
-        if best_opt["ltp"] >= st.session_state.exit_price:
-            browser_alert("TARGET HIT", f"[MOCK] P&L: +{pnl}")
-            st.balloons(); st.success(f"[MOCK] Target hit! P&L: ₹{pnl:+,.2f}")
-            add_log("act_log", {"time":now_ts,"event":f"[MOCK] Target hit @ ₹{best_opt['ltp']:.2f} | P&L ₹{pnl:+.2f}"})
-            st.session_state.trade_active = False; st.rerun()
-        if best_opt["ltp"] <= tsl and st.session_state.highest_pnl > 0:
-            browser_alert("TRAILING SL HIT", f"[MOCK] Exiting. P&L: {pnl:+}")
-            st.error(f"[MOCK] Trailing SL hit! P&L: ₹{pnl:+,.2f}")
-            add_log("act_log", {"time":now_ts,"event":f"[MOCK] TSL hit @ ₹{best_opt['ltp']:.2f} | P&L ₹{pnl:+.2f}"})
-            st.session_state.trade_active = False; st.rerun()
-        if st.button("Emergency exit (mockup)", use_container_width=True):
-            add_log("act_log", {"time":now_ts,"event":f"[MOCK] Manual exit @ ₹{best_opt['ltp']:.2f} | P&L ₹{pnl:+.2f}"})
-            st.session_state.trade_active = False; st.rerun()
+        # ── Exit conditions — SL and manual exit blocked during min-hold ──
+        if best_opt["ltp"] >= _target:
+            browser_alert("TARGET HIT", f"[MOCK] P&L: ₹{pnl:+.2f}")
+            st.balloons()
+            st.success(f"Target hit! P&L: ₹{pnl:+,.2f}")
+            add_log("act_log", {"time":now_ts,
+                "event":f"[MOCK] Target ₹{_target} hit @ ₹{best_opt['ltp']:.2f} | P&L ₹{pnl:+.2f}"})
+            st.session_state.trade_active = False
+            st.rerun()
+
+        if min_held and best_opt["ltp"] <= effective_sl:
+            _sl_type = "TSL" if tsl > _sl_fixed else "SL"
+            browser_alert(f"{_sl_type} HIT", f"[MOCK] P&L: ₹{pnl:+.2f}")
+            st.error(f"{_sl_type} hit at ₹{effective_sl:,.2f} | P&L: ₹{pnl:+,.2f}")
+            add_log("act_log", {"time":now_ts,
+                "event":f"[MOCK] {_sl_type} ₹{effective_sl:.2f} hit @ ₹{best_opt['ltp']:.2f} | P&L ₹{pnl:+.2f}"})
+            st.session_state.trade_active = False
+            st.rerun()
+
+        # Emergency exit — available any time, but shows warning during min-hold
+        if not min_held:
+            st.caption(f"⚠ Emergency exit available but min-hold ({rm}:{rs:02d} left) not complete.")
+        if st.button("Emergency exit (mockup)", use_container_width=True,
+                     type="secondary", disabled=False):
+            add_log("act_log", {"time":now_ts,
+                "event":f"[MOCK] Emergency exit @ ₹{best_opt['ltp']:.2f} | P&L ₹{pnl:+.2f} | held {elapsed}s"})
+            st.session_state.trade_active = False
+            st.rerun()
 
     if st.session_state.act_log:
         with st.expander("Activity log", expanded=False):
