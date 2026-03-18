@@ -12,6 +12,8 @@ import requests
 import streamlit.components.v1 as components
 from datetime import date, timedelta
 from collections import deque
+from concurrent.futures import ThreadPoolExecutor, Future
+import threading
 
 # ─────────────────────────────────────────────
 # TOKEN — read from secrets.toml
@@ -88,6 +90,11 @@ def _init():
         lo_qty          = 1,
         lo_target_pts   = 50,
         lo_tsl_pct      = 30.0,
+        # background option scan
+        cached_best_opt = None,
+        scan_running    = False,
+        scan_last_ts    = 0.0,
+        scan_status     = "Not started",
     )
     for k, v in defaults.items():
         if k not in st.session_state:
@@ -195,6 +202,7 @@ def get_chain(ikey, expiry):
     return r.json()["data"]
 
 def find_best_option(spot, ikey):
+    """Pure data function — no Streamlit calls. Safe to run in a background thread."""
     expiry = get_nearest_expiry(ikey)
     chain  = get_chain(ikey, expiry)
     rows   = []
@@ -213,20 +221,53 @@ def find_best_option(spot, ikey):
                              "prev_oi":prev_oi,"iv":iv,"ikey":o_ikey,
                              "dist":abs(sp-spot),"expiry":expiry})
     if not rows: return None
-    df       = pd.DataFrame(rows)
-    oi_thr   = np.percentile(df["oi"], OI_PERCENTILE)
-    df_top   = df[df["oi"] >= oi_thr].nsmallest(TOP_N_STRIKES, "dist")
-    results  = []
-    prog     = st.progress(0, text="Scanning option chain for highest ADX…")
-    for i, (_, row) in enumerate(df_top.iterrows()):
+    df      = pd.DataFrame(rows)
+    oi_thr  = np.percentile(df["oi"], OI_PERCENTILE)
+    df_top  = df[df["oi"] >= oi_thr].nsmallest(TOP_N_STRIKES, "dist")
+    results = []
+    for _, row in df_top.iterrows():
         try:
             dmi = compute_dmi(get_candles(row["ikey"]), ADX_PERIOD)
             if dmi: results.append({**row.to_dict(), **dmi})
         except Exception:
             pass
-        prog.progress((i+1)/len(df_top), text=f"Scanning {row['side']} {int(row['strike'])}…")
-    prog.empty()
     return max(results, key=lambda x: x["adx"]) if results else None
+
+
+# Thread pool — one worker keeps scans off the main thread
+_scan_executor = ThreadPoolExecutor(max_workers=1, thread_name_prefix="opt-scan")
+_scan_lock     = threading.Lock()
+_SCAN_INTERVAL = 60   # re-scan option chain every 60 s; index/spot refresh every 5 s
+
+def _bg_scan_done(future: Future, spot: float):
+    """Callback executed when background scan finishes — writes to session state."""
+    with _scan_lock:
+        try:
+            result = future.result()
+            if result:
+                st.session_state.cached_best_opt = result
+                st.session_state.scan_status     = f"Updated {pd.Timestamp.now(tz='Asia/Kolkata').strftime('%H:%M:%S')}"
+            else:
+                st.session_state.scan_status = "No result — retrying next cycle"
+        except Exception as e:
+            st.session_state.scan_status = f"Scan error: {e}"
+        finally:
+            st.session_state.scan_running = False
+
+def trigger_bg_scan(spot, ikey):
+    """Fire-and-forget: submits scan to thread pool if not already running."""
+    import time as _time
+    now = _time.monotonic()
+    with _scan_lock:
+        if st.session_state.scan_running:
+            return
+        if (now - st.session_state.scan_last_ts) < _SCAN_INTERVAL:
+            return
+        st.session_state.scan_running = True
+        st.session_state.scan_last_ts = now
+        st.session_state.scan_status  = "Scanning…"
+    future = _scan_executor.submit(find_best_option, spot, ikey)
+    future.add_done_callback(lambda f: _bg_scan_done(f, spot))
 
 # ─────────────────────────────────────────────
 # LIVE ORDER PLACEMENT
@@ -386,22 +427,44 @@ def _live():
 
     # ─────────────────────────────────────────────
     # FETCH MARKET DATA
+    # LTP + DMI: every 5 s (fast, single API call each)
+    # Option chain scan: every 60 s in a background thread — never blocks the UI
     # ─────────────────────────────────────────────
     try:
         if MOCK_MODE:
-            live_px, dmi, best_opt = mock_data(selected)
+            live_px, dmi, best_opt_fresh = mock_data(selected)
+            # In mock mode update cache every cycle
+            st.session_state.cached_best_opt = best_opt_fresh
+            st.session_state.scan_status     = "Mock"
         else:
-            live_px  = get_live_price(ikey)
-            df_idx   = get_candles(ikey)
-            dmi      = compute_dmi(df_idx, ADX_PERIOD)
-            if not dmi: st.warning("Waiting for candles…"); st.stop()
-            best_opt = find_best_option(live_px, ikey)
+            live_px = get_live_price(ikey)
+            df_idx  = get_candles(ikey)
+            dmi     = compute_dmi(df_idx, ADX_PERIOD)
+            if not dmi:
+                st.warning("Waiting for candles…")
+                st.stop()
+            # Kick off background scan (no-op if already running or too soon)
+            trigger_bg_scan(live_px, ikey)
     except Exception as e:
-        st.error(f"API error: {e}"); st.stop()
-
-    if not best_opt:
-        st.warning("No option signal found — chain may be empty or market just opened.")
+        st.error(f"API error: {e}")
         st.stop()
+
+    # Use cached result — available immediately on every 5-s tick
+    best_opt = st.session_state.cached_best_opt
+    if not best_opt:
+        st.info("Option scan in progress — index data loading…")
+        # Still show index metrics while first scan runs
+        if not MOCK_MODE:
+            st.caption(f"Scan status: {st.session_state.scan_status}")
+        st.stop()
+
+    # Patch live LTP into cached option if same ikey (keeps price fresh)
+    if not MOCK_MODE:
+        try:
+            fresh_ltp = get_live_price(best_opt["ikey"])
+            best_opt  = {**best_opt, "ltp": fresh_ltp}
+        except Exception:
+            pass  # keep cached ltp if call fails
 
     # Push rolling history
     now_ts = ts()
@@ -474,7 +537,9 @@ def _live():
         if best_opt["side"] == "CE" else
         ("Rising PE OI → support building"    if oi_chg > 0 else "Falling PE OI → short covering, bearish")
     )
-    st.caption(f"OI insight: {oi_note}   |   `{best_opt['ikey']}`")
+    _scan_col1, _scan_col2 = st.columns([4, 1])
+    _scan_col1.caption(f"OI insight: {oi_note}   |   `{best_opt['ikey']}`")
+    _scan_col2.caption(f"Chain scan: {st.session_state.scan_status}")
 
     st.divider()
 
