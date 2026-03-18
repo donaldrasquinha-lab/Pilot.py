@@ -9,7 +9,6 @@ import streamlit as st
 import pandas as pd
 import numpy as np
 import requests
-import time
 import streamlit.components.v1 as components
 from datetime import date, timedelta
 from collections import deque
@@ -61,6 +60,10 @@ def _init():
         entry_pdi       = 0.0,
         entry_ndi       = 0.0,
         entry_side      = "",
+        entry_strike    = 0,
+        entry_expiry    = "",
+        entry_ikey      = "",
+        entry_opt_ltp   = 0.0,
         target_pts      = 0,
         trailing_sl_pct = 30.0,
         exit_price      = 0.0,
@@ -135,18 +138,24 @@ def compute_dmi(df, period=14):
     up   = h[1:]-h[:-1]; dn = l[:-1]-l[1:]
     dm_p = np.where((up>dn)&(up>0), up, 0.0)
     dm_n = np.where((dn>up)&(dn>0), dn, 0.0)
-    def w(a, p):
-        o = np.zeros(len(a)); o[p-1] = a[:p].sum()
-        for i in range(p, len(a)): o[i] = o[i-1]-o[i-1]/p+a[i]
-        return o
-    atr  = w(tr, period); sdmp = w(dm_p, period); sdmn = w(dm_n, period)
-    safe = np.where(atr==0, 1e-10, atr)
-    pdi  = 100*sdmp/safe; ndi = 100*sdmn/safe
-    dx   = 100*np.abs(pdi-ndi)/np.where((pdi+ndi)==0,1e-10,pdi+ndi)
-    adx  = w(dx, period)
-    return {"adx":round(float(adx[-1]),2),
-            "pdi":round(float(pdi[-1]),2),
-            "ndi":round(float(ndi[-1]),2)}
+    # Wilder RMA = pandas EWM with alpha=1/period (mathematically identical,
+    # naturally bounded 0-100, no seed inflation bug)
+    def rma(a, p):
+        return pd.Series(a).ewm(alpha=1/p, min_periods=p, adjust=False).mean().values
+
+    atr  = rma(tr,   period)
+    sdmp = rma(dm_p, period)
+    sdmn = rma(dm_n, period)
+    safe = np.where(atr == 0, 1e-10, atr)
+    pdi  = np.clip(100 * sdmp / safe, 0, 100)
+    ndi  = np.clip(100 * sdmn / safe, 0, 100)
+    dx   = 100 * np.abs(pdi - ndi) / np.where((pdi + ndi) == 0, 1e-10, pdi + ndi)
+    adx  = np.clip(rma(dx, period), 0, 100)
+    return {
+        "adx": round(float(adx[-1]), 2),
+        "pdi": round(float(pdi[-1]), 2),
+        "ndi": round(float(ndi[-1]), 2),
+    }
 
 # ─────────────────────────────────────────────
 # UPSTOX API CALLS
@@ -344,425 +353,467 @@ if selected != st.session_state.selected_index:
 ikey     = INDICES[selected]["key"]
 lot_size = INDICES[selected]["lot"]
 
-# Live spot price
-if MOCK_MODE:
-    spot_display = round({"Nifty 50":24500,"Nifty Bank":51000,"Nifty Fin Svc":22000,
-                          "Nifty Midcap 50":12000,"Sensex":80000}.get(selected,24500)
-                         + np.random.uniform(-30,30), 2)
-else:
-    try:
-        spot_display = get_live_price(ikey)
-    except Exception:
-        spot_display = 0.0
-
-hdr_px.metric("Spot", f"₹{spot_display:,.2f}")
-hdr_mode.warning("Mock") if MOCK_MODE else hdr_mode.success("Live")
-
-if MOCK_MODE:
-    st.info(
-        "Running in **mock mode**. "
-        "Add your Upstox access token to `.streamlit/secrets.toml` under `[upstox]` to go live."
-    )
-
-# ─────────────────────────────────────────────
-# FETCH MARKET DATA
-# ─────────────────────────────────────────────
-try:
+# ── LIVE FRAGMENT — reruns every 5 s without touching the static shell above
+@st.fragment(run_every=5)
+def _live():
+    # Live spot price
     if MOCK_MODE:
-        live_px, dmi, best_opt = mock_data(selected)
+        spot_display = round({"Nifty 50":24500,"Nifty Bank":51000,"Nifty Fin Svc":22000,
+                              "Nifty Midcap 50":12000,"Sensex":80000}.get(selected,24500)
+                             + np.random.uniform(-30,30), 2)
     else:
-        live_px  = get_live_price(ikey)
-        df_idx   = get_candles(ikey)
-        dmi      = compute_dmi(df_idx, ADX_PERIOD)
-        if not dmi: st.warning("Waiting for candles…"); st.stop()
-        best_opt = find_best_option(live_px, ikey)
-except Exception as e:
-    st.error(f"API error: {e}"); st.stop()
+        try:
+            spot_display = get_live_price(ikey)
+        except Exception:
+            spot_display = 0.0
 
-if not best_opt:
-    st.warning("No option signal found — chain may be empty or market just opened.")
-    st.stop()
+    hdr_px.metric("Spot", f"₹{spot_display:,.2f}")
+    if MOCK_MODE:
+        hdr_mode.warning("Mock")
+    else:
+        hdr_mode.success("Live")
 
-# Push rolling history
-now_ts = ts()
-st.session_state.h_times.append(now_ts)
-st.session_state.h_opt_ltp.append(best_opt["ltp"])
-st.session_state.h_opt_adx.append(best_opt["adx"])
-st.session_state.h_idx_adx.append(dmi["adx"])
-st.session_state.h_opt_pdi.append(best_opt["pdi"])
-st.session_state.h_opt_ndi.append(best_opt["ndi"])
-st.session_state.h_oi.append(best_opt["oi"])
+    if MOCK_MODE:
+        st.info(
+            "Running in **mock mode**. "
+            "Add your Upstox access token to `.streamlit/secrets.toml` under `[upstox]` to go live."
+        )
 
-score, checks    = buy_confidence(dmi, best_opt)
-idx_g            = gear(dmi["adx"])
-opt_g            = gear(best_opt["adx"])
-bullish          = dmi["pdi"] > dmi["ndi"]
-oi_chg           = best_opt["oi"] - best_opt.get("prev_oi", best_opt["oi"])
+    # ─────────────────────────────────────────────
+    # FETCH MARKET DATA
+    # ─────────────────────────────────────────────
+    try:
+        if MOCK_MODE:
+            live_px, dmi, best_opt = mock_data(selected)
+        else:
+            live_px  = get_live_price(ikey)
+            df_idx   = get_candles(ikey)
+            dmi      = compute_dmi(df_idx, ADX_PERIOD)
+            if not dmi: st.warning("Waiting for candles…"); st.stop()
+            best_opt = find_best_option(live_px, ikey)
+    except Exception as e:
+        st.error(f"API error: {e}"); st.stop()
 
-# ══════════════════════════════════════════════
-# DASHBOARD 1 — INDEX + BUY SIGNAL
-# ══════════════════════════════════════════════
-st.subheader(f"{selected} — index")
-c1, c2, c3, c4 = st.columns(4)
-c1.metric("LTP",       f"₹{live_px:,.2f}")
-c2.metric("ADX",       f"{dmi['adx']:.2f}", f"Gear {idx_g} → +{GEAR_PTS[idx_g]} pts")
-c3.metric("+DI / -DI", f"{dmi['pdi']:.2f} / {dmi['ndi']:.2f}")
-c4.metric("Signal",    "BULLISH" if bullish else "BEARISH")
+    if not best_opt:
+        st.warning("No option signal found — chain may be empty or market just opened.")
+        st.stop()
 
-sig = "BULLISH" if bullish else "BEARISH"
-if st.session_state.last_signal and st.session_state.last_signal != sig:
-    browser_alert("SIGNAL CHANGE", f"{selected} is now {sig}")
-st.session_state.last_signal = sig
+    # Push rolling history
+    now_ts = ts()
+    st.session_state.h_times.append(now_ts)
+    st.session_state.h_opt_ltp.append(best_opt["ltp"])
+    st.session_state.h_opt_adx.append(best_opt["adx"])
+    st.session_state.h_idx_adx.append(dmi["adx"])
+    st.session_state.h_opt_pdi.append(best_opt["pdi"])
+    st.session_state.h_opt_ndi.append(best_opt["ndi"])
+    st.session_state.h_oi.append(best_opt["oi"])
 
-st.divider()
+    score, checks    = buy_confidence(dmi, best_opt)
+    idx_g            = gear(dmi["adx"])
+    opt_g            = gear(best_opt["adx"])
+    bullish          = dmi["pdi"] > dmi["ndi"]
+    oi_chg           = best_opt["oi"] - best_opt.get("prev_oi", best_opt["oi"])
 
-# Best option buy box
-st.subheader("Best option to buy")
-bdr = "#3B6D11" if best_opt["side"] == "CE" else "#854F0B"
-bbg = "#f0faf4" if best_opt["side"] == "CE" else "#fff8f0"
-st.markdown(f"""
-<div style="border:2px solid {bdr};border-radius:12px;padding:14px 18px;background:{bbg};margin-bottom:14px">
-  <div style="display:flex;justify-content:space-between;align-items:flex-start">
-    <div>
-      <div style="font-size:11px;font-weight:500;color:{bdr};letter-spacing:.05em;margin-bottom:3px">BUY SIGNAL</div>
-      <div style="display:flex;align-items:baseline;gap:8px">
-        <span style="font-size:26px;font-weight:500;color:{bdr}">{best_opt['side']} {int(best_opt['strike'])}</span>
-        <span style="font-size:12px;color:gray">exp {best_opt['expiry']}</span>
-      </div>
-      <div style="font-size:12px;color:gray;margin-top:2px">LTP &nbsp;
-        <span style="font-size:20px;font-weight:500;color:#111">₹{best_opt['ltp']:.2f}</span>
+    # ══════════════════════════════════════════════
+    # DASHBOARD 1 — INDEX + BUY SIGNAL
+    # ══════════════════════════════════════════════
+    st.subheader(f"{selected} — index")
+    c1, c2, c3, c4 = st.columns(4)
+    c1.metric("LTP",       f"₹{live_px:,.2f}")
+    c2.metric("ADX",       f"{dmi['adx']:.2f}", f"Gear {idx_g} → +{GEAR_PTS[idx_g]} pts")
+    c3.metric("+DI / -DI", f"{dmi['pdi']:.2f} / {dmi['ndi']:.2f}")
+    c4.metric("Signal",    "BULLISH" if bullish else "BEARISH")
+
+    sig = "BULLISH" if bullish else "BEARISH"
+    if st.session_state.last_signal and st.session_state.last_signal != sig:
+        browser_alert("SIGNAL CHANGE", f"{selected} is now {sig}")
+    st.session_state.last_signal = sig
+
+    st.divider()
+
+    # Best option buy box
+    st.subheader("Best option to buy")
+    bdr = "#3B6D11" if best_opt["side"] == "CE" else "#854F0B"
+    bbg = "#f0faf4" if best_opt["side"] == "CE" else "#fff8f0"
+    st.markdown(f"""
+    <div style="border:2px solid {bdr};border-radius:12px;padding:14px 18px;background:{bbg};margin-bottom:14px">
+      <div style="display:flex;justify-content:space-between;align-items:flex-start">
+        <div>
+          <div style="font-size:11px;font-weight:500;color:{bdr};letter-spacing:.05em;margin-bottom:3px">BUY SIGNAL</div>
+          <div style="display:flex;align-items:baseline;gap:8px">
+            <span style="font-size:26px;font-weight:500;color:{bdr}">{best_opt['side']} {int(best_opt['strike'])}</span>
+            <span style="font-size:12px;color:gray">exp {best_opt['expiry']}</span>
+          </div>
+          <div style="font-size:12px;color:gray;margin-top:2px">LTP &nbsp;
+            <span style="font-size:20px;font-weight:500;color:#111">₹{best_opt['ltp']:.2f}</span>
+          </div>
+        </div>
+        <div style="text-align:right">
+          <div style="font-size:10px;color:gray">Option ADX</div>
+          <div style="font-size:30px;font-weight:500;color:{bdr}">{best_opt['adx']:.2f}</div>
+          <div style="font-size:11px;color:gray">Gear {opt_g}</div>
+        </div>
       </div>
     </div>
-    <div style="text-align:right">
-      <div style="font-size:10px;color:gray">Option ADX</div>
-      <div style="font-size:30px;font-weight:500;color:{bdr}">{best_opt['adx']:.2f}</div>
-      <div style="font-size:11px;color:gray">Gear {opt_g}</div>
-    </div>
+    """, unsafe_allow_html=True)
+
+    d1,d2,d3,d4,d5 = st.columns(5)
+    d1.metric("OI",        f"{best_opt['oi']:,}")
+    d2.metric("OI change", f"{oi_chg:+,}", f"{oi_chg/max(best_opt.get('prev_oi',1),1)*100:+.1f}%")
+    d3.metric("IV",        f"{best_opt['iv']:.1f}%")
+    d4.metric("+DI",       f"{best_opt['pdi']:.2f}")
+    d5.metric("-DI",       f"{best_opt['ndi']:.2f}")
+
+    oi_note = (
+        ("Rising CE OI → resistance building" if oi_chg > 0 else "Falling CE OI → short covering, bullish")
+        if best_opt["side"] == "CE" else
+        ("Rising PE OI → support building"    if oi_chg > 0 else "Falling PE OI → short covering, bearish")
+    )
+    st.caption(f"OI insight: {oi_note}   |   `{best_opt['ikey']}`")
+
+    st.divider()
+
+    # ── MOCKUP TRADE CONTROL ──────────────────────
+    st.subheader("Trade control — mockup")
+    st.caption("Simulates entries and exits locally. No real order is sent.")
+
+    if not st.session_state.trade_active or st.session_state.trade_mode != "mockup":
+        if st.button("Enter trade (mockup)", use_container_width=True, type="primary"):
+            st.session_state.trade_active  = True
+            st.session_state.trade_mode    = "mockup"
+            st.session_state.entry_price   = best_opt["ltp"]
+            st.session_state.entry_adx     = best_opt["adx"]
+            st.session_state.entry_pdi     = best_opt["pdi"]
+            st.session_state.entry_ndi     = best_opt["ndi"]
+            st.session_state.entry_side    = best_opt["side"]
+            st.session_state.entry_strike  = int(best_opt["strike"])
+            st.session_state.entry_expiry  = best_opt["expiry"]
+            st.session_state.entry_ikey    = best_opt["ikey"]
+            st.session_state.entry_opt_ltp = best_opt["ltp"]
+            st.session_state.target_pts    = GEAR_PTS[opt_g]
+            st.session_state.exit_price    = round(best_opt["ltp"] + GEAR_PTS[opt_g], 2)
+            st.session_state.sl_price      = round(best_opt["ltp"] * 0.85, 2)
+            st.session_state.highest_pnl   = 0.0
+            st.session_state.monitor_start = time.time()
+            add_log("act_log", {"time":now_ts,"event":f"[MOCK] Entered {best_opt['side']} {int(best_opt['strike'])} @ ₹{best_opt['ltp']:.2f}"})
+            st.rerun()
+    elif st.session_state.trade_active and st.session_state.trade_mode == "mockup":
+        pnl = round(best_opt["ltp"] - st.session_state.entry_price, 2)
+        tsl = update_trailing_sl(best_opt["ltp"], st.session_state.entry_price,
+                                 st.session_state.trailing_sl_pct)
+        st.session_state.sl_price = tsl
+
+        # ── Selected option pill ──
+        _side    = st.session_state.entry_side
+        _strike  = st.session_state.entry_strike
+        _expiry  = st.session_state.entry_expiry
+        _ikey    = st.session_state.entry_ikey
+        _eltp    = st.session_state.entry_opt_ltp
+        _opt_bdr = "#3B6D11" if _side == "CE" else "#854F0B"
+        _opt_bg  = "#EAF3DE" if _side == "CE" else "#FAEEDA"
+        _opt_tc  = "#27500A" if _side == "CE" else "#633806"
+        _cur_ltp = best_opt["ltp"] if best_opt.get("ikey") == _ikey else _eltp
+        _ltp_chg = round(_cur_ltp - _eltp, 2)
+        _chg_col = "#3B6D11" if _ltp_chg >= 0 else "#A32D2D"
+        st.markdown(f"""
+<div style="border:2px solid {_opt_bdr};border-radius:10px;padding:11px 16px;
+            background:{_opt_bg};margin-bottom:12px;
+            display:flex;align-items:center;justify-content:space-between">
+  <div style="display:flex;align-items:center;gap:10px">
+    <span style="background:{_opt_bdr};color:#fff;border-radius:5px;
+                 padding:2px 9px;font-size:11px;font-weight:500">{_side}</span>
+    <span style="font-size:20px;font-weight:500;color:{_opt_tc}">{_strike}</span>
+    <span style="font-size:12px;color:{_opt_tc};opacity:.75">exp {_expiry}</span>
+  </div>
+  <div style="text-align:right">
+    <span style="font-size:18px;font-weight:500;color:{_opt_tc}">₹{_cur_ltp:.2f}</span>
+    <span style="font-size:12px;color:{_chg_col};margin-left:6px">
+      {'+' if _ltp_chg >= 0 else ''}{_ltp_chg:.2f} from entry</span>
   </div>
 </div>
 """, unsafe_allow_html=True)
 
-d1,d2,d3,d4,d5 = st.columns(5)
-d1.metric("OI",        f"{best_opt['oi']:,}")
-d2.metric("OI change", f"{oi_chg:+,}", f"{oi_chg/max(best_opt.get('prev_oi',1),1)*100:+.1f}%")
-d3.metric("IV",        f"{best_opt['iv']:.1f}%")
-d4.metric("+DI",       f"{best_opt['pdi']:.2f}")
-d5.metric("-DI",       f"{best_opt['ndi']:.2f}")
+        st.warning(f"Trade live — target +{st.session_state.target_pts} pts | Trailing SL {st.session_state.trailing_sl_pct:.0f}%")
+        m1,m2,m3,m4 = st.columns(4)
+        m1.metric("Entry price",  f"₹{st.session_state.entry_price:,.2f}")
+        m2.metric("Exit target",  f"₹{st.session_state.exit_price:,.2f}")
+        m3.metric("Trailing SL",  f"₹{tsl:,.2f}")
+        m4.metric("Live P&L",     f"₹{pnl:+,.2f}")
 
-oi_note = (
-    ("Rising CE OI → resistance building" if oi_chg > 0 else "Falling CE OI → short covering, bullish")
-    if best_opt["side"] == "CE" else
-    ("Rising PE OI → support building"    if oi_chg > 0 else "Falling PE OI → short covering, bearish")
-)
-st.caption(f"OI insight: {oi_note}   |   `{best_opt['ikey']}`")
+        if best_opt["ltp"] >= st.session_state.exit_price:
+            browser_alert("TARGET HIT", f"[MOCK] P&L: +{pnl}")
+            st.balloons(); st.success(f"[MOCK] Target hit! P&L: ₹{pnl:+,.2f}")
+            add_log("act_log", {"time":now_ts,"event":f"[MOCK] Target hit @ ₹{best_opt['ltp']:.2f} | P&L ₹{pnl:+.2f}"})
+            st.session_state.trade_active = False; st.rerun()
+        if best_opt["ltp"] <= tsl and st.session_state.highest_pnl > 0:
+            browser_alert("TRAILING SL HIT", f"[MOCK] Exiting. P&L: {pnl:+}")
+            st.error(f"[MOCK] Trailing SL hit! P&L: ₹{pnl:+,.2f}")
+            add_log("act_log", {"time":now_ts,"event":f"[MOCK] TSL hit @ ₹{best_opt['ltp']:.2f} | P&L ₹{pnl:+.2f}"})
+            st.session_state.trade_active = False; st.rerun()
+        if st.button("Emergency exit (mockup)", use_container_width=True):
+            add_log("act_log", {"time":now_ts,"event":f"[MOCK] Manual exit @ ₹{best_opt['ltp']:.2f} | P&L ₹{pnl:+.2f}"})
+            st.session_state.trade_active = False; st.rerun()
 
-st.divider()
+    if st.session_state.act_log:
+        with st.expander("Activity log", expanded=False):
+            st.dataframe(pd.DataFrame(st.session_state.act_log[:20]),
+                         hide_index=True, use_container_width=True)
 
-# ── MOCKUP TRADE CONTROL ──────────────────────
-st.subheader("Trade control — mockup")
-st.caption("Simulates entries and exits locally. No real order is sent.")
+    # ══════════════════════════════════════════════
+    # DASHBOARD 2 — SIGNAL ANALYSIS + 15-MIN
+    # ══════════════════════════════════════════════
+    st.markdown("---")
+    st.subheader("Signal analysis — 15-min comparison & trade monitor")
 
-if not st.session_state.trade_active or st.session_state.trade_mode != "mockup":
-    if st.button("Enter trade (mockup)", use_container_width=True, type="primary"):
-        st.session_state.trade_active  = True
-        st.session_state.trade_mode    = "mockup"
-        st.session_state.entry_price   = best_opt["ltp"]
-        st.session_state.entry_adx     = best_opt["adx"]
-        st.session_state.entry_pdi     = best_opt["pdi"]
-        st.session_state.entry_ndi     = best_opt["ndi"]
-        st.session_state.entry_side    = best_opt["side"]
-        st.session_state.target_pts    = GEAR_PTS[opt_g]
-        st.session_state.exit_price    = round(best_opt["ltp"] + GEAR_PTS[opt_g], 2)
-        st.session_state.sl_price      = round(best_opt["ltp"] * 0.85, 2)
-        st.session_state.highest_pnl   = 0.0
-        st.session_state.monitor_start = time.time()
-        add_log("act_log", {"time":now_ts,"event":f"[MOCK] Entered {best_opt['side']} {int(best_opt['strike'])} @ ₹{best_opt['ltp']:.2f}"})
-        st.rerun()
-elif st.session_state.trade_active and st.session_state.trade_mode == "mockup":
-    pnl = round(best_opt["ltp"] - st.session_state.entry_price, 2)
-    tsl = update_trailing_sl(best_opt["ltp"], st.session_state.entry_price,
-                             st.session_state.trailing_sl_pct)
-    st.warning(f"[MOCK] Trade live — target +{st.session_state.target_pts} pts")
-    m1,m2,m3,m4 = st.columns(4)
-    m1.metric("Entry",        f"₹{st.session_state.entry_price:,.2f}")
-    m2.metric("Exit target",  f"₹{st.session_state.exit_price:,.2f}")
-    m3.metric("Trailing SL",  f"₹{tsl:,.2f}")
-    m4.metric("Live P&L",     f"₹{pnl:+,.2f}")
-    st.session_state.sl_price = tsl
+    left, right = st.columns([1.2, 1])
+    with left:
+        def pct(cur, ref): return round((cur-ref)/abs(ref)*100,1) if ref else 0.0
+        h15 = {k: ha(st.session_state[f"h_{k}"]) for k in
+               ["opt_ltp","opt_adx","idx_adx","opt_pdi","opt_ndi","oi"]}
+        cmp = {
+            "Metric":  ["Option LTP","Option ADX","Index ADX","+DI","-DI","OI"],
+            "Now":     [f"₹{best_opt['ltp']:.2f}",f"{best_opt['adx']:.2f}",
+                        f"{dmi['adx']:.2f}",f"{best_opt['pdi']:.2f}",
+                        f"{best_opt['ndi']:.2f}",f"{best_opt['oi']:,}"],
+            "15m avg": [f"₹{h15['opt_ltp']:.2f}",f"{h15['opt_adx']:.2f}",
+                        f"{h15['idx_adx']:.2f}",f"{h15['opt_pdi']:.2f}",
+                        f"{h15['opt_ndi']:.2f}",f"{h15['oi']:,.0f}"],
+            "Change":  [f"{pct(best_opt['ltp'],h15['opt_ltp']):+.1f}%",
+                        f"{pct(best_opt['adx'],h15['opt_adx']):+.1f}%",
+                        f"{pct(dmi['adx'],h15['idx_adx']):+.1f}%",
+                        f"{pct(best_opt['pdi'],h15['opt_pdi']):+.1f}%",
+                        f"{pct(best_opt['ndi'],h15['opt_ndi']):+.1f}%",
+                        f"{pct(best_opt['oi'],h15['oi']):+.1f}%"],
+        }
+        st.dataframe(pd.DataFrame(cmp), hide_index=True, use_container_width=True)
 
-    if best_opt["ltp"] >= st.session_state.exit_price:
-        browser_alert("TARGET HIT", f"[MOCK] P&L: +{pnl}")
-        st.balloons(); st.success(f"[MOCK] Target hit! P&L: ₹{pnl:+,.2f}")
-        add_log("act_log", {"time":now_ts,"event":f"[MOCK] Target hit @ ₹{best_opt['ltp']:.2f} | P&L ₹{pnl:+.2f}"})
-        st.session_state.trade_active = False; time.sleep(2); st.rerun()
-    if best_opt["ltp"] <= tsl and st.session_state.highest_pnl > 0:
-        browser_alert("TRAILING SL HIT", f"[MOCK] Exiting. P&L: {pnl:+}")
-        st.error(f"[MOCK] Trailing SL hit! P&L: ₹{pnl:+,.2f}")
-        add_log("act_log", {"time":now_ts,"event":f"[MOCK] TSL hit @ ₹{best_opt['ltp']:.2f} | P&L ₹{pnl:+.2f}"})
-        st.session_state.trade_active = False; time.sleep(2); st.rerun()
-    if st.button("Emergency exit (mockup)", use_container_width=True):
-        add_log("act_log", {"time":now_ts,"event":f"[MOCK] Manual exit @ ₹{best_opt['ltp']:.2f} | P&L ₹{pnl:+.2f}"})
-        st.session_state.trade_active = False; st.rerun()
+        if len(st.session_state.h_opt_ltp) > 1:
+            chart_df = pd.DataFrame({
+                "Option LTP": list(st.session_state.h_opt_ltp),
+                "Option ADX": list(st.session_state.h_opt_adx),
+            }, index=list(st.session_state.h_times))
+            st.line_chart(chart_df, height=160)
 
-if st.session_state.act_log:
-    with st.expander("Activity log", expanded=False):
-        st.dataframe(pd.DataFrame(st.session_state.act_log[:20]),
+    with right:
+        verdict_lbl = "BUY" if score>=75 else "WAIT" if score>=45 else "AVOID"
+        if score >= 75:   st.success(f"**BUY** — Confidence {score}/100")
+        elif score >= 45: st.warning(f"**WAIT** — Confidence {score}/100")
+        else:             st.error(f"**AVOID** — Confidence {score}/100")
+        for label, passed, pts in checks:
+            st.markdown(f"{'✅' if passed else '❌'} {label} &nbsp; `+{pts if passed else 0}/{pts}`")
+
+    st.divider()
+
+    # 5-min monitor
+    st.subheader("5-min trade monitor")
+    if st.session_state.monitor_start:
+        elapsed   = int(time.time() - st.session_state.monitor_start)
+        remaining = MONITOR_SECS - elapsed % MONITOR_SECS
+        mm, ss    = divmod(remaining, 60)
+        st.markdown(f"Next 5-min update in: **{mm}:{ss:02d}**")
+
+    n1,n2,n3,n4 = st.columns(4)
+    n1.metric("Entry",       f"₹{st.session_state.entry_price:,.2f}" if st.session_state.trade_active else "—")
+    n2.metric("Current LTP", f"₹{best_opt['ltp']:.2f}")
+
+    if st.session_state.trade_active:
+        pnl2      = round(best_opt["ltp"] - st.session_state.entry_price, 2)
+        adx_fall  = best_opt["adx"] < st.session_state.entry_adx - 5
+        dir_flip  = ((best_opt["side"]=="CE" and best_opt["ndi"]>best_opt["pdi"]) or
+                     (best_opt["side"]=="PE" and best_opt["pdi"]>best_opt["ndi"]))
+        if   pnl2 > 20:    rec, rmsg = "EXIT", "Target reached — book profit"
+        elif pnl2 < -15:   rec, rmsg = "EXIT", "Stop-loss zone"
+        elif adx_fall:     rec, rmsg = "WEAK", "ADX falling — trend weakening"
+        elif dir_flip:     rec, rmsg = "FLIP", "DI crossover — direction reversed"
+        else:              rec, rmsg = "HOLD", f"Conditions holding (score {score}/100)"
+        n3.metric("P&L", f"₹{pnl2:+,.2f}")
+        n4.metric("Recommendation", rec)
+        add_log("signal_log", {"time":now_ts,"type":rec,"msg":rmsg})
+        if rec == "EXIT":   st.error(f"**{rec}** — {rmsg}")
+        elif rec == "HOLD": st.success(f"**HOLD** — {rmsg}")
+        else:               st.warning(f"**{rec}** — {rmsg}")
+    else:
+        n3.metric("P&L","—")
+        n4.metric("Status","Ready" if score>=75 else "Wait" if score>=45 else "Avoid")
+
+    if st.session_state.signal_log:
+        st.dataframe(pd.DataFrame(st.session_state.signal_log[:10]),
                      hide_index=True, use_container_width=True)
 
-# ══════════════════════════════════════════════
-# DASHBOARD 2 — SIGNAL ANALYSIS + 15-MIN
-# ══════════════════════════════════════════════
-st.markdown("---")
-st.subheader("Signal analysis — 15-min comparison & trade monitor")
+    # ══════════════════════════════════════════════
+    # DASHBOARD 3 — LIVE ORDER PLACEMENT
+    # ══════════════════════════════════════════════
+    st.markdown("---")
+    st.subheader("Live order placement")
 
-left, right = st.columns([1.2, 1])
-with left:
-    def pct(cur, ref): return round((cur-ref)/abs(ref)*100,1) if ref else 0.0
-    h15 = {k: ha(st.session_state[f"h_{k}"]) for k in
-           ["opt_ltp","opt_adx","idx_adx","opt_pdi","opt_ndi","oi"]}
-    cmp = {
-        "Metric":  ["Option LTP","Option ADX","Index ADX","+DI","-DI","OI"],
-        "Now":     [f"₹{best_opt['ltp']:.2f}",f"{best_opt['adx']:.2f}",
-                    f"{dmi['adx']:.2f}",f"{best_opt['pdi']:.2f}",
-                    f"{best_opt['ndi']:.2f}",f"{best_opt['oi']:,}"],
-        "15m avg": [f"₹{h15['opt_ltp']:.2f}",f"{h15['opt_adx']:.2f}",
-                    f"{h15['idx_adx']:.2f}",f"{h15['opt_pdi']:.2f}",
-                    f"{h15['opt_ndi']:.2f}",f"{h15['oi']:,.0f}"],
-        "Change":  [f"{pct(best_opt['ltp'],h15['opt_ltp']):+.1f}%",
-                    f"{pct(best_opt['adx'],h15['opt_adx']):+.1f}%",
-                    f"{pct(dmi['adx'],h15['idx_adx']):+.1f}%",
-                    f"{pct(best_opt['pdi'],h15['opt_pdi']):+.1f}%",
-                    f"{pct(best_opt['ndi'],h15['opt_ndi']):+.1f}%",
-                    f"{pct(best_opt['oi'],h15['oi']):+.1f}%"],
-    }
-    st.dataframe(pd.DataFrame(cmp), hide_index=True, use_container_width=True)
-
-    if len(st.session_state.h_opt_ltp) > 1:
-        chart_df = pd.DataFrame({
-            "Option LTP": list(st.session_state.h_opt_ltp),
-            "Option ADX": list(st.session_state.h_opt_adx),
-        }, index=list(st.session_state.h_times))
-        st.line_chart(chart_df, height=160)
-
-with right:
-    verdict_lbl = "BUY" if score>=75 else "WAIT" if score>=45 else "AVOID"
-    if score >= 75:   st.success(f"**BUY** — Confidence {score}/100")
-    elif score >= 45: st.warning(f"**WAIT** — Confidence {score}/100")
-    else:             st.error(f"**AVOID** — Confidence {score}/100")
-    for label, passed, pts in checks:
-        st.markdown(f"{'✅' if passed else '❌'} {label} &nbsp; `+{pts if passed else 0}/{pts}`")
-
-st.divider()
-
-# 5-min monitor
-st.subheader("5-min trade monitor")
-if st.session_state.monitor_start:
-    elapsed   = int(time.time() - st.session_state.monitor_start)
-    remaining = MONITOR_SECS - elapsed % MONITOR_SECS
-    mm, ss    = divmod(remaining, 60)
-    st.markdown(f"Next 5-min update in: **{mm}:{ss:02d}**")
-
-n1,n2,n3,n4 = st.columns(4)
-n1.metric("Entry",       f"₹{st.session_state.entry_price:,.2f}" if st.session_state.trade_active else "—")
-n2.metric("Current LTP", f"₹{best_opt['ltp']:.2f}")
-
-if st.session_state.trade_active:
-    pnl2      = round(best_opt["ltp"] - st.session_state.entry_price, 2)
-    adx_fall  = best_opt["adx"] < st.session_state.entry_adx - 5
-    dir_flip  = ((best_opt["side"]=="CE" and best_opt["ndi"]>best_opt["pdi"]) or
-                 (best_opt["side"]=="PE" and best_opt["pdi"]>best_opt["ndi"]))
-    if   pnl2 > 20:    rec, rmsg = "EXIT", "Target reached — book profit"
-    elif pnl2 < -15:   rec, rmsg = "EXIT", "Stop-loss zone"
-    elif adx_fall:     rec, rmsg = "WEAK", "ADX falling — trend weakening"
-    elif dir_flip:     rec, rmsg = "FLIP", "DI crossover — direction reversed"
-    else:              rec, rmsg = "HOLD", f"Conditions holding (score {score}/100)"
-    n3.metric("P&L", f"₹{pnl2:+,.2f}")
-    n4.metric("Recommendation", rec)
-    add_log("signal_log", {"time":now_ts,"type":rec,"msg":rmsg})
-    if rec == "EXIT":   st.error(f"**{rec}** — {rmsg}")
-    elif rec == "HOLD": st.success(f"**HOLD** — {rmsg}")
-    else:               st.warning(f"**{rec}** — {rmsg}")
-else:
-    n3.metric("P&L","—")
-    n4.metric("Status","Ready" if score>=75 else "Wait" if score>=45 else "Avoid")
-
-if st.session_state.signal_log:
-    st.dataframe(pd.DataFrame(st.session_state.signal_log[:10]),
-                 hide_index=True, use_container_width=True)
-
-# ══════════════════════════════════════════════
-# DASHBOARD 3 — LIVE ORDER PLACEMENT
-# ══════════════════════════════════════════════
-st.markdown("---")
-st.subheader("Live order placement")
-
-if MOCK_MODE:
-    st.warning(
-        "Live order placement is **disabled in mock mode**. "
-        "Add your Upstox access token to `.streamlit/secrets.toml` to enable real trading."
-    )
-else:
-    st.error(
-        "Real money trading. Every order below is sent live to Upstox. "
-        "Double-check all fields before confirming."
-    )
-
-    with st.expander("Configure & place live order", expanded=True):
-        st.markdown("**Step 1 — Select the option to trade**")
-
-        # Load full chain for manual selection
-        try:
-            expiry_sel = get_nearest_expiry(ikey)
-            chain_sel  = get_chain(ikey, expiry_sel)
-        except Exception as e:
-            st.error(f"Could not load chain: {e}"); chain_sel = []
-
-        strikes = sorted({int(s["strike_price"]) for s in chain_sel})
-        sides   = ["CE", "PE"]
-
-        col_s, col_side, col_exp = st.columns(3)
-        lo_strike_val = col_s.selectbox(
-            "Strike", strikes,
-            index=strikes.index(int(best_opt["strike"])) if int(best_opt["strike"]) in strikes else 0
+    if MOCK_MODE:
+        st.warning(
+            "Live order placement is **disabled in mock mode**. "
+            "Add your Upstox access token to `.streamlit/secrets.toml` to enable real trading."
         )
-        lo_side_val   = col_side.selectbox(
-            "Side", sides,
-            index=sides.index(best_opt["side"])
+    else:
+        st.error(
+            "Real money trading. Every order below is sent live to Upstox. "
+            "Double-check all fields before confirming."
         )
-        col_exp.text_input("Expiry", value=expiry_sel, disabled=True)
 
-        # Resolve instrument key from selection
-        lo_ikey_val = None
-        for row in chain_sel:
-            if int(row["strike_price"]) == lo_strike_val:
-                opt_key = "call_options" if lo_side_val == "CE" else "put_options"
-                lo_ikey_val = row.get(opt_key, {}).get("instrument_key")
-                break
+        with st.expander("Configure & place live order", expanded=True):
+            st.markdown("**Step 1 — Select the option to trade**")
 
-        # Find LTP for selected option
-        lo_ltp = 0.0
-        if lo_ikey_val:
+            # Load full chain for manual selection
+            try:
+                expiry_sel = get_nearest_expiry(ikey)
+                chain_sel  = get_chain(ikey, expiry_sel)
+            except Exception as e:
+                st.error(f"Could not load chain: {e}"); chain_sel = []
+
+            strikes = sorted({int(s["strike_price"]) for s in chain_sel})
+            sides   = ["CE", "PE"]
+
+            col_s, col_side, col_exp = st.columns(3)
+            lo_strike_val = col_s.selectbox(
+                "Strike", strikes,
+                index=strikes.index(int(best_opt["strike"])) if int(best_opt["strike"]) in strikes else 0
+            )
+            lo_side_val   = col_side.selectbox(
+                "Side", sides,
+                index=sides.index(best_opt["side"])
+            )
+            col_exp.text_input("Expiry", value=expiry_sel, disabled=True)
+
+            # Resolve instrument key from selection
+            lo_ikey_val = None
             for row in chain_sel:
                 if int(row["strike_price"]) == lo_strike_val:
                     opt_key = "call_options" if lo_side_val == "CE" else "put_options"
-                    lo_ltp  = row.get(opt_key,{}).get("market_data",{}).get("ltp",0) or 0
+                    lo_ikey_val = row.get(opt_key, {}).get("instrument_key")
                     break
-        if lo_ltp:
-            st.caption(f"Selected option LTP: ₹{lo_ltp:.2f} | Key: `{lo_ikey_val}`")
 
-        st.markdown("**Step 2 — Set quantity, target & trailing SL**")
-        col_q, col_t, col_tsl = st.columns(3)
-        lo_qty_val    = col_q.number_input("Lots", min_value=1, max_value=50, value=1, step=1)
-        lo_target_val = col_t.number_input("Target (pts)", min_value=10, max_value=500,
-                                            value=GEAR_PTS[opt_g], step=10)
-        lo_tsl_val    = col_tsl.number_input("Trailing SL (%)", min_value=5.0, max_value=80.0,
-                                              value=30.0, step=5.0)
+            # Find LTP for selected option
+            lo_ltp = 0.0
+            if lo_ikey_val:
+                for row in chain_sel:
+                    if int(row["strike_price"]) == lo_strike_val:
+                        opt_key = "call_options" if lo_side_val == "CE" else "put_options"
+                        lo_ltp  = row.get(opt_key,{}).get("market_data",{}).get("ltp",0) or 0
+                        break
+            if lo_ltp:
+                st.caption(f"Selected option LTP: ₹{lo_ltp:.2f} | Key: `{lo_ikey_val}`")
 
-        qty_units     = lo_qty_val * lot_size
-        target_px_val = round(lo_ltp + lo_target_val, 2) if lo_ltp else 0.0
-        sl_px_val     = round(lo_ltp * (1 - lo_tsl_val / 100), 2) if lo_ltp else 0.0
+            st.markdown("**Step 2 — Set quantity, target & trailing SL**")
+            col_q, col_t, col_tsl = st.columns(3)
+            lo_qty_val    = col_q.number_input("Lots", min_value=1, max_value=50, value=1, step=1)
+            lo_target_val = col_t.number_input("Target (pts)", min_value=10, max_value=500,
+                                                value=GEAR_PTS[opt_g], step=10)
+            lo_tsl_val    = col_tsl.number_input("Trailing SL (%)", min_value=5.0, max_value=80.0,
+                                                  value=30.0, step=5.0)
 
-        st.markdown("**Step 3 — Review & confirm**")
-        r1, r2, r3, r4 = st.columns(4)
-        r1.metric("Entry LTP",    f"₹{lo_ltp:.2f}")
-        r2.metric("Target price", f"₹{target_px_val:.2f}")
-        r3.metric("Init SL",      f"₹{sl_px_val:.2f}")
-        r4.metric("Total qty",    f"{qty_units} units ({lo_qty_val} lot{'s' if lo_qty_val>1 else ''})")
+            qty_units     = lo_qty_val * lot_size
+            target_px_val = round(lo_ltp + lo_target_val, 2) if lo_ltp else 0.0
+            sl_px_val     = round(lo_ltp * (1 - lo_tsl_val / 100), 2) if lo_ltp else 0.0
 
-        st.markdown("**Step 4 — Place order**")
-        col_place, col_cancel = st.columns(2)
+            st.markdown("**Step 3 — Review & confirm**")
+            r1, r2, r3, r4 = st.columns(4)
+            r1.metric("Entry LTP",    f"₹{lo_ltp:.2f}")
+            r2.metric("Target price", f"₹{target_px_val:.2f}")
+            r3.metric("Init SL",      f"₹{sl_px_val:.2f}")
+            r4.metric("Total qty",    f"{qty_units} units ({lo_qty_val} lot{'s' if lo_qty_val>1 else ''})")
 
-        if not st.session_state.trade_active:
-            confirm = col_place.checkbox("I confirm this is a live order with real money")
-            if confirm:
-                if col_place.button("Place BUY order (LIVE)", use_container_width=True, type="primary"):
-                    if not lo_ikey_val:
-                        st.error("Could not resolve instrument key for the selected strike.")
-                    else:
+            st.markdown("**Step 4 — Place order**")
+            col_place, col_cancel = st.columns(2)
+
+            if not st.session_state.trade_active:
+                confirm = col_place.checkbox("I confirm this is a live order with real money")
+                if confirm:
+                    if col_place.button("Place BUY order (LIVE)", use_container_width=True, type="primary"):
+                        if not lo_ikey_val:
+                            st.error("Could not resolve instrument key for the selected strike.")
+                        else:
+                            try:
+                                order_id = place_market_order(lo_ikey_val, qty_units, "BUY")
+                                # Also place initial SL order
+                                sl_trigger = sl_px_val
+                                sl_limit   = round(sl_trigger * 0.995, 2)
+                                sl_oid     = place_sl_order(lo_ikey_val, qty_units, sl_trigger, sl_limit, "SELL")
+
+                                st.session_state.trade_active   = True
+                                st.session_state.trade_mode     = "live"
+                                st.session_state.entry_price    = lo_ltp
+                                st.session_state.entry_side     = lo_side_val
+                                st.session_state.target_pts     = lo_target_val
+                                st.session_state.exit_price     = target_px_val
+                                st.session_state.sl_price       = sl_px_val
+                                st.session_state.trailing_sl_pct= lo_tsl_val
+                                st.session_state.highest_pnl    = 0.0
+                                st.session_state.live_order_id  = order_id
+                                st.session_state.monitor_start  = time.time()
+                                st.session_state.lo_ikey        = lo_ikey_val
+                                st.session_state.lo_qty         = qty_units
+
+                                add_log("act_log", {
+                                    "time": now_ts,
+                                    "event": f"[LIVE] BUY {lo_side_val} {lo_strike_val} "
+                                             f"qty={qty_units} order_id={order_id} | "
+                                             f"SL order={sl_oid}"
+                                })
+                                st.success(f"Order placed! ID: {order_id}")
+                                st.rerun()
+                            except Exception as e:
+                                st.error(f"Order failed: {e}")
+            else:
+                if st.session_state.trade_mode == "live":
+                    pnl_live  = round(best_opt["ltp"] - st.session_state.entry_price, 2)
+                    tsl_live  = update_trailing_sl(best_opt["ltp"], st.session_state.entry_price,
+                                                   st.session_state.trailing_sl_pct)
+                    st.session_state.sl_price = tsl_live
+                    l1,l2,l3,l4 = st.columns(4)
+                    l1.metric("Entry",          f"₹{st.session_state.entry_price:,.2f}")
+                    l2.metric("Target",         f"₹{st.session_state.exit_price:,.2f}")
+                    l3.metric("Trailing SL",    f"₹{tsl_live:,.2f}")
+                    l4.metric("Live P&L",       f"₹{pnl_live:+,.2f}")
+
+                    # Auto-exit checks for live trade
+                    if best_opt["ltp"] >= st.session_state.exit_price:
+                        browser_alert("TARGET HIT", f"[LIVE] P&L: +{pnl_live}")
+                        st.success(f"[LIVE] Target hit! P&L: ₹{pnl_live:+,.2f}")
                         try:
-                            order_id = place_market_order(lo_ikey_val, qty_units, "BUY")
-                            # Also place initial SL order
-                            sl_trigger = sl_px_val
-                            sl_limit   = round(sl_trigger * 0.995, 2)
-                            sl_oid     = place_sl_order(lo_ikey_val, qty_units, sl_trigger, sl_limit, "SELL")
-
-                            st.session_state.trade_active   = True
-                            st.session_state.trade_mode     = "live"
-                            st.session_state.entry_price    = lo_ltp
-                            st.session_state.entry_side     = lo_side_val
-                            st.session_state.target_pts     = lo_target_val
-                            st.session_state.exit_price     = target_px_val
-                            st.session_state.sl_price       = sl_px_val
-                            st.session_state.trailing_sl_pct= lo_tsl_val
-                            st.session_state.highest_pnl    = 0.0
-                            st.session_state.live_order_id  = order_id
-                            st.session_state.monitor_start  = time.time()
-                            st.session_state.lo_ikey        = lo_ikey_val
-                            st.session_state.lo_qty         = qty_units
-
-                            add_log("act_log", {
-                                "time": now_ts,
-                                "event": f"[LIVE] BUY {lo_side_val} {lo_strike_val} "
-                                         f"qty={qty_units} order_id={order_id} | "
-                                         f"SL order={sl_oid}"
-                            })
-                            st.success(f"Order placed! ID: {order_id}")
-                            st.rerun()
+                            exit_id = place_market_order(st.session_state.lo_ikey,
+                                                         st.session_state.lo_qty, "SELL")
+                            add_log("act_log", {"time":now_ts,
+                                "event":f"[LIVE] Target exit order={exit_id} P&L ₹{pnl_live:+.2f}"})
                         except Exception as e:
-                            st.error(f"Order failed: {e}")
-        else:
-            if st.session_state.trade_mode == "live":
-                pnl_live  = round(best_opt["ltp"] - st.session_state.entry_price, 2)
-                tsl_live  = update_trailing_sl(best_opt["ltp"], st.session_state.entry_price,
-                                               st.session_state.trailing_sl_pct)
-                st.session_state.sl_price = tsl_live
-                l1,l2,l3,l4 = st.columns(4)
-                l1.metric("Entry",          f"₹{st.session_state.entry_price:,.2f}")
-                l2.metric("Target",         f"₹{st.session_state.exit_price:,.2f}")
-                l3.metric("Trailing SL",    f"₹{tsl_live:,.2f}")
-                l4.metric("Live P&L",       f"₹{pnl_live:+,.2f}")
+                            st.error(f"Exit order failed: {e}")
+                        st.session_state.trade_active = False; st.rerun()
 
-                # Auto-exit checks for live trade
-                if best_opt["ltp"] >= st.session_state.exit_price:
-                    browser_alert("TARGET HIT", f"[LIVE] P&L: +{pnl_live}")
-                    st.success(f"[LIVE] Target hit! P&L: ₹{pnl_live:+,.2f}")
-                    try:
-                        exit_id = place_market_order(st.session_state.lo_ikey,
-                                                     st.session_state.lo_qty, "SELL")
-                        add_log("act_log", {"time":now_ts,
-                            "event":f"[LIVE] Target exit order={exit_id} P&L ₹{pnl_live:+.2f}"})
-                    except Exception as e:
-                        st.error(f"Exit order failed: {e}")
-                    st.session_state.trade_active = False; time.sleep(2); st.rerun()
+                    if best_opt["ltp"] <= tsl_live and st.session_state.highest_pnl > 0:
+                        browser_alert("TSL HIT", f"[LIVE] Trailing SL triggered. P&L: {pnl_live:+}")
+                        st.error(f"[LIVE] Trailing SL hit! P&L: ₹{pnl_live:+,.2f}")
+                        try:
+                            exit_id = place_market_order(st.session_state.lo_ikey,
+                                                         st.session_state.lo_qty, "SELL")
+                            add_log("act_log", {"time":now_ts,
+                                "event":f"[LIVE] TSL exit order={exit_id} P&L ₹{pnl_live:+.2f}"})
+                        except Exception as e:
+                            st.error(f"TSL exit order failed: {e}")
+                        st.session_state.trade_active = False; st.rerun()
 
-                if best_opt["ltp"] <= tsl_live and st.session_state.highest_pnl > 0:
-                    browser_alert("TSL HIT", f"[LIVE] Trailing SL triggered. P&L: {pnl_live:+}")
-                    st.error(f"[LIVE] Trailing SL hit! P&L: ₹{pnl_live:+,.2f}")
-                    try:
-                        exit_id = place_market_order(st.session_state.lo_ikey,
-                                                     st.session_state.lo_qty, "SELL")
-                        add_log("act_log", {"time":now_ts,
-                            "event":f"[LIVE] TSL exit order={exit_id} P&L ₹{pnl_live:+.2f}"})
-                    except Exception as e:
-                        st.error(f"TSL exit order failed: {e}")
-                    st.session_state.trade_active = False; time.sleep(2); st.rerun()
+                    if col_cancel.button("Exit position (LIVE)", use_container_width=True):
+                        try:
+                            exit_id = place_market_order(st.session_state.lo_ikey,
+                                                         st.session_state.lo_qty, "SELL")
+                            add_log("act_log", {"time":now_ts,
+                                "event":f"[LIVE] Manual exit order={exit_id} P&L ₹{pnl_live:+.2f}"})
+                            browser_alert("EXIT", f"[LIVE] Manual exit | P&L ₹{pnl_live:+.2f}")
+                        except Exception as e:
+                            st.error(f"Exit failed: {e}")
+                        st.session_state.trade_active = False; st.rerun()
 
-                if col_cancel.button("Exit position (LIVE)", use_container_width=True):
-                    try:
-                        exit_id = place_market_order(st.session_state.lo_ikey,
-                                                     st.session_state.lo_qty, "SELL")
-                        add_log("act_log", {"time":now_ts,
-                            "event":f"[LIVE] Manual exit order={exit_id} P&L ₹{pnl_live:+.2f}"})
-                        browser_alert("EXIT", f"[LIVE] Manual exit | P&L ₹{pnl_live:+.2f}")
-                    except Exception as e:
-                        st.error(f"Exit failed: {e}")
-                    st.session_state.trade_active = False; st.rerun()
+    # ── FOOTER ──
+    st.caption(
+        f"Index: `{ikey}` | Lot size: {lot_size} | ADX period: {ADX_PERIOD} | "
+        f"History: {len(st.session_state.h_opt_ltp)}/{HISTORY_LEN} bars | "
+        f"Refresh: {pd.Timestamp.now(tz='Asia/Kolkata').strftime('%H:%M:%S IST')}"
+    )
+    # auto-refresh handled by @st.fragment(run_every=5)
 
-# ── FOOTER ──
-st.caption(
-    f"Index: `{ikey}` | Lot size: {lot_size} | ADX period: {ADX_PERIOD} | "
-    f"History: {len(st.session_state.h_opt_ltp)}/{HISTORY_LEN} bars | "
-    f"Refresh: {pd.Timestamp.now(tz='Asia/Kolkata').strftime('%H:%M:%S IST')}"
-)
-time.sleep(5)
-st.rerun()
+_live()
